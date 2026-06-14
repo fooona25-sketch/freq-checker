@@ -63,6 +63,7 @@ with st.sidebar:
     st.header("ตัวเลือกการเทียบ")
     section = st.selectbox("Special section ที่จะตรวจ", ["API/A", "CR/C", "Notif"], index=0)
     min_khz = st.number_input("ตัดทิ้งจุดทับซ้อนที่แคบกว่า (kHz)", min_value=0.0, value=0.0, step=10.0)
+    only_downlink = st.checkbox("แสดงเฉพาะขาลง (Emission) ที่กระทบภาคพื้น", value=False)
 
 # ---------- ข้อมูลต่างชาติ (IFIC) ----------
 st.subheader("1) อัปโหลดฐานข้อมูล BR IFIC")
@@ -79,6 +80,8 @@ if run:
             path = tf.name
         fgn = engine.extract_foreign(path, section)
         matches = engine.compute_overlaps(fgn, thai_df, min_overlap_khz=min_khz)
+        if only_downlink:
+            matches = matches[matches["ขาลง_กระทบภาคพื้น"] == "✔"].reset_index(drop=True)
         summary = engine.summarise(matches)
 
     c1, c2, c3 = st.columns(3)

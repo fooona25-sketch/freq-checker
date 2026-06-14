@@ -19,7 +19,7 @@ PROV_BY_SECTION = {
 }
 
 # emi_rcp values in the BR grp table
-DIRECTION_LABEL = {"E": "Tx (E)", "R": "Rx (R)"}
+DIRECTION_LABEL = {"E": "Emission (ขาลง)", "R": "Reception (ขาขึ้น)"}
 
 
 def _mdb_table(mdb_path: str, table: str) -> pd.DataFrame:
@@ -120,6 +120,7 @@ def compute_overlaps(foreign: pd.DataFrame, thai: pd.DataFrame,
                     "foreign_type": f["type"],
                     "foreign_beam": f["beam"],
                     "foreign_dir": f["direction"],
+                    "ขาลง_กระทบภาคพื้น": "✔" if f.get("emi_rcp") == "E" else "",
                     "foreign_f_min": round(f["f_min_mhz"], 4),
                     "foreign_f_max": round(f["f_max_mhz"], 4),
                     "thai_network": t["thai_network"],
