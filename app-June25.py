@@ -3,6 +3,7 @@
 ThaiSat Freq Checker — โหมด 9.3 (API/A)
 ขอบเขต = portal CSV (รายการตีพิมพ์ทางการ ITU)  |  ความถี่ = ific.mdb
 จับคู่ด้วย Notice ID (+ Targeted notice ID สำหรับ MOD), กรอง wic_no = เลข IFIC ของไฟล์
+ฐานความถี่ไทย: Google Sheet (thai_sheet_csv_url ใน Secrets) หรืออัปโหลด Excel/CSV
 """
 import streamlit as st
 import subprocess, csv, io, tempfile, os
@@ -12,6 +13,32 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
 st.set_page_config(page_title="ThaiSat Freq Checker — 9.3", layout="wide")
+
+# ---------------- secrets (safe) ----------------
+def get_secret(key, default=None):
+    """อ่าน secret อย่างปลอดภัย — ถ้าไม่มีไฟล์ secrets เลยก็ไม่ทำให้แอปพัง"""
+    try:
+        return st.secrets.get(key, default)
+    except Exception:
+        return default
+
+# ---------------- password gate (robust) ----------------
+def check_password():
+    pw_secret = get_secret("password")
+    # ถ้ายังไม่ได้ตั้งรหัสใน Secrets → เตือนแต่ให้เข้าได้ (กันจอขาว)
+    if not pw_secret:
+        st.warning('ยังไม่ได้ตั้งรหัสผ่านใน Secrets — เพิ่มบรรทัด  password = "รหัสของคุณ"  '
+                   'ในหน้า Settings → Secrets เพื่อเปิดด่านรหัสผ่าน (ตอนนี้เข้าใช้ได้โดยไม่ต้องใส่รหัส)')
+        return True
+    if st.session_state.get("auth_ok"):
+        return True
+    pw = st.text_input("🔒 รหัสผ่าน", type="password")
+    if pw:
+        if pw == pw_secret:
+            st.session_state["auth_ok"] = True
+            return True
+        st.error("รหัสผ่านไม่ถูกต้อง")
+    return False
 
 # ---------------- mdb helpers ----------------
 def mdb_table(mdb_path, table):
@@ -36,6 +63,28 @@ def col(row, *names):
         if n in row:
             return row[n]
     return ""
+
+# ---------------- Thai base ----------------
+def normalise_thai(df):
+    df.columns = [c.strip().lower() for c in df.columns]
+    need = {"network_name", "freq_start_mhz", "freq_end_mhz"}
+    if not need.issubset(df.columns):
+        raise ValueError("ฐานไทยต้องมีคอลัมน์: network_name, freq_start_mhz, freq_end_mhz")
+    df = df.dropna(subset=["freq_start_mhz", "freq_end_mhz"]).copy()
+    df["freq_start_mhz"] = pd.to_numeric(df["freq_start_mhz"], errors="coerce")
+    df["freq_end_mhz"] = pd.to_numeric(df["freq_end_mhz"], errors="coerce")
+    return df.dropna(subset=["freq_start_mhz", "freq_end_mhz"])
+
+def load_thai(upload, sheet_url):
+    """คืน (df, แหล่งที่มา) — ให้ความสำคัญกับไฟล์ที่อัปโหลดก่อน, ไม่งั้นใช้ Google Sheet"""
+    if upload is not None:
+        df = (pd.read_csv(upload) if upload.name.lower().endswith(".csv")
+              else pd.read_excel(upload))
+        return normalise_thai(df), "ไฟล์ที่อัปโหลด"
+    if sheet_url:
+        df = pd.read_csv(sheet_url)
+        return normalise_thai(df), "Google Sheet"
+    return None, None
 
 # ---------------- core ----------------
 def build_foreign_apia(mdb_path, portal_rows, ific):
@@ -63,21 +112,6 @@ def build_foreign_apia(mdb_path, portal_rows, ific):
                     "f_min": float(g["freq_min"]), "f_max": float(g["freq_max"]),
                 })
     return pd.DataFrame(foreign), apia, nodata
-
-def load_thai(upload):
-    if upload is None and st.secrets.get("thai_sheet_csv_url"):
-        df = pd.read_csv(st.secrets["thai_sheet_csv_url"])
-    elif upload is not None:
-        df = (pd.read_csv(upload) if upload.name.lower().endswith(".csv")
-              else pd.read_excel(upload))
-    else:
-        return None
-    df.columns = [c.strip().lower() for c in df.columns]
-    need = {"network_name", "freq_start_mhz", "freq_end_mhz"}
-    if not need.issubset(df.columns):
-        raise ValueError("ฐานไทยต้องมีคอลัมน์: network_name, freq_start_mhz, freq_end_mhz")
-    df = df.dropna(subset=["freq_start_mhz", "freq_end_mhz"])
-    return df
 
 def overlap(foreign, thai, min_khz=0.0):
     min_mhz = min_khz / 1000.0
@@ -143,8 +177,11 @@ def to_excel_bytes(summary, detail, nodata, ific):
 
     buf = io.BytesIO(); wb.save(buf); return buf.getvalue()
 
-# ---------------- UI ----------------
+# ================= UI =================
 st.title("🛰️ ตรวจความถี่ดาวเทียม — โหมด 9.3 (API/A)")
+
+if not check_password():
+    st.stop()
 
 st.markdown(
     "อัปโหลด **2 ไฟล์**: ฐานข้อมูล `ific.mdb` (ความถี่) และ **portal CSV** "
@@ -153,9 +190,25 @@ st.markdown(
 c1, c2 = st.columns(2)
 mdb_file = c1.file_uploader("1) ไฟล์ ific.mdb", type=["mdb"])
 portal_file = c2.file_uploader("2) portal CSV (รายการตีพิมพ์)", type=["csv"])
-thai_file = st.file_uploader(
-    "3) ฐานความถี่ไทย (Excel/CSV) — ข้ามได้ถ้าตั้งค่า Google Sheet ไว้แล้ว",
-    type=["xlsx", "csv"])
+
+# --- ฐานความถี่ไทย: Google Sheet หรืออัปโหลด ---
+sheet_url = get_secret("thai_sheet_csv_url")
+if sheet_url:
+    st.success("ฐานความถี่ไทย: ใช้จาก **Google Sheet** ที่ตั้งไว้ใน Secrets "
+               "(อัปโหลดไฟล์ด้านล่างเพื่อใช้แทนเฉพาะครั้งนี้ได้)")
+else:
+    st.info("ฐานความถี่ไทย: ยังไม่ได้ตั้ง Google Sheet — อัปโหลดไฟล์ด้านล่าง "
+            'หรือเพิ่ม  thai_sheet_csv_url = "ลิงก์ CSV"  ใน Secrets')
+thai_file = st.file_uploader("3) ฐานความถี่ไทย (Excel/CSV) — ข้ามได้ถ้าใช้ Google Sheet", type=["xlsx", "csv"])
+
+with st.expander("ℹ️ วิธีตั้ง Google Sheet เป็นฐานความถี่ไทย"):
+    st.markdown(
+        "1. ใน Google ชีต: **ไฟล์ → แชร์ → เผยแพร่ไปยังเว็บ**\n"
+        "2. เลือกรูปแบบ **CSV** → เผยแพร่ → คัดลอกลิงก์ (ลงท้าย `output=csv`)\n"
+        "3. ใส่ใน **Settings → Secrets**:  `thai_sheet_csv_url = \"ลิงก์ที่คัดลอก\"`\n"
+        "4. ชีตต้องมีคอลัมน์: **network_name, freq_start_mhz, freq_end_mhz**"
+    )
+
 min_khz = st.number_input("กรองจุดทับซ้อนที่เล็กกว่า (kHz) — 0 = เอาทุกจุด",
                           min_value=0.0, value=0.0, step=1.0)
 
@@ -170,14 +223,20 @@ if st.button("▶ ประมวลผล", type="primary"):
         notice = mdb_table(mdb_path, "notice")
         ific = detect_ific(notice)
         portal_rows = read_portal_csv(portal_file)
-        thai = load_thai(thai_file)
+
+        try:
+            thai, thai_src = load_thai(thai_file, sheet_url)
+        except Exception as e:
+            st.error(f"อ่านฐานความถี่ไทยไม่สำเร็จ: {e}")
+            st.stop()
         if thai is None:
-            st.error("ยังไม่มีฐานความถี่ไทย — อัปโหลดไฟล์ หรือตั้งค่า thai_sheet_csv_url ใน Secrets")
+            st.error("ยังไม่มีฐานความถี่ไทย — อัปโหลดไฟล์ หรือตั้งค่า Google Sheet ใน Secrets")
             st.stop()
 
         foreign, apia, nodata = build_foreign_apia(mdb_path, portal_rows, ific)
         os.unlink(mdb_path)
 
+        st.caption(f"ฐานความถี่ไทย: {thai_src} ({len(thai)} ย่าน)")
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("IFIC", ific)
         m2.metric("API/A (ขอบเขต)", len(apia))
@@ -204,9 +263,9 @@ if st.button("▶ ประมวลผล", type="primary"):
                 .reset_index())
 
         st.subheader("สรุปต่อข่าย")
-        st.dataframe(summ, use_container_width=True)
+        st.dataframe(summ, width="stretch")
         st.subheader("รายละเอียดจุดทับซ้อน")
-        st.dataframe(detail, use_container_width=True)
+        st.dataframe(detail, width="stretch")
 
         xls = to_excel_bytes(summ, detail, nodata, ific)
         st.download_button("⬇ ดาวน์โหลดผลเป็น Excel", xls,
