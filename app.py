@@ -114,21 +114,25 @@ def build_foreign_apia(mdb_path, portal_rows, ific):
     return pd.DataFrame(foreign), apia, nodata
 
 def overlap(foreign, thai, min_khz=0.0):
+    # min_khz = 0  -> รวม "แตะขอบ" (ทับกันพอดี 0 MHz) ด้วย
+    # min_khz > 0  -> เอาเฉพาะทับจริงที่กว้างกว่าค่าที่ตั้ง (ตัดแตะขอบทิ้ง)
     min_mhz = min_khz / 1000.0
     rows = []
     for f in foreign.itertuples(index=False):
         for t in thai.itertuples(index=False):
             lo = max(f.f_min, t.freq_start_mhz)
             hi = min(f.f_max, t.freq_end_mhz)
-            if hi - lo > min_mhz:
+            width = hi - lo
+            if width >= min_mhz and width >= 0:
                 rows.append({
                     "ดาวเทียมต่างชาติ": f.sat, "adm": f.adm,
                     "ทิศทาง": "ขาลง (E)" if f.emi == "E" else "ขาขึ้น (R)",
                     "ขาลงกระทบภาคพื้น": "✔" if f.emi == "E" else "",
+                    "ประเภท": "ทับจริง" if width > 0 else "แตะขอบ (0 MHz)",
                     "beam": f.beam, "ตปท_f_min": round(f.f_min, 4), "ตปท_f_max": round(f.f_max, 4),
                     "ข่ายไทย": t.network_name,
                     "overlap_min": round(lo, 4), "overlap_max": round(hi, 4),
-                    "overlap_MHz": round(hi - lo, 4),
+                    "overlap_MHz": round(width, 4),
                 })
     return pd.DataFrame(rows)
 
@@ -154,7 +158,7 @@ def to_excel_bytes(summary, detail, nodata, ific):
     ws.append(list(summary.columns))
     for _, r in summary.iterrows():
         ws.append(list(r))
-    for col_, w in zip("ABCD", [22, 18, 16, 80]):
+    for col_, w in zip("ABCDEFG", [22, 8, 16, 10, 10, 10, 70]):
         ws.column_dimensions[col_].width = w
     style(ws)
 
@@ -162,7 +166,7 @@ def to_excel_bytes(summary, detail, nodata, ific):
     ws2.append(list(detail.columns))
     for _, r in detail.iterrows():
         ws2.append(list(r))
-    for col_, w in zip("ABCDEFGHIJK", [22, 8, 12, 16, 12, 12, 12, 22, 12, 12, 12]):
+    for col_, w in zip("ABCDEFGHIJKL", [20, 8, 12, 14, 14, 16, 12, 12, 22, 12, 12, 12]):
         ws2.column_dimensions[col_].width = w
     style(ws2)
 
@@ -256,8 +260,14 @@ if st.button("▶ ประมวลผล", type="primary"):
             st.success("ไม่มีความถี่ใดทับซ้อนกับฐานไทย")
             st.stop()
 
+        n_real = int((detail["ประเภท"] == "ทับจริง").sum())
+        n_edge = int((detail["ประเภท"] == "แตะขอบ (0 MHz)").sum())
+        st.caption(f"จุดทับซ้อนทั้งหมด {len(detail)}  —  ทับจริง {n_real} | แตะขอบ (0 MHz) {n_edge}")
+
         summ = (detail.groupby(["ดาวเทียมต่างชาติ", "adm"])
                 .agg(ข่ายไทยที่กระทบ=("ข่ายไทย", "nunique"),
+                     ทับจริง=("ประเภท", lambda s: int((s == "ทับจริง").sum())),
+                     แตะขอบ=("ประเภท", lambda s: int((s == "แตะขอบ (0 MHz)").sum())),
                      มีขาลง=("ขาลงกระทบภาคพื้น", lambda s: "✔" if (s == "✔").any() else ""),
                      รายชื่อข่ายไทย=("ข่ายไทย", lambda s: ", ".join(sorted(set(s)))))
                 .reset_index())
