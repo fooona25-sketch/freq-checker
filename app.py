@@ -8,7 +8,7 @@ ThaiSat Freq Checker
 ชื่อข่ายไทยเรียงลงบรรทัดในเซลล์เดียว พร้อมก๊อปลง Word)
 """
 import streamlit as st
-import subprocess, csv, io, tempfile, os
+import subprocess, csv, io, tempfile, os, math
 import pandas as pd
 from collections import defaultdict, Counter
 from openpyxl import Workbook
@@ -101,7 +101,9 @@ def fmt_lon(x):
         v = round(float(x), 1)
     except ValueError:
         return x
-    return f"{int(v)} E" if v == int(v) else f"{v} E"
+    hemi = "E" if v >= 0 else "W"
+    v = abs(v)
+    return f"{int(v)} {hemi}" if v == int(v) else f"{v} {hemi}"
 
 def thai_label(sat_name, long_nom):
     """ชื่อข่ายไทยสำหรับบันทึก: GSO -> 'ชื่อ (xx E)', NGSO -> 'ชื่อ (NGSO)'"""
@@ -259,6 +261,88 @@ def sec_num(sec):
     except Exception:
         return ""
 
+# ================= เครื่องคิด pfd สำหรับ 9.14 =================
+# เกณฑ์: RR Appendix 5 Annex 1 — §1.1 (ต่ำกว่า 1 GHz) และ Table 5-2 (1–3 GHz, Rev.WRC-19)
+# (f_lo, f_hi, ref_bw, P_gso, r_gso, P_ngso, r_ngso)  — r=None = ค่าคงที่ทุกมุม
+PFD_TH = [
+    (137.0,   138.0,  "4kHz", -125, None, -125, None),   # AP5 §1.1
+    (400.15,  401.0,  "4kHz", -125, None, -125, None),   # AP5 §1.1
+    (1518.0,  1525.0, "1MHz", -128, 0.5,  -128, 0.5),    # Table 5-2
+    (1525.0,  1530.0, "1MHz", -128, 0.5,  -128, 0.5),    # Table 5-2
+    (2160.0,  2200.0, "1MHz", -128, 0.5,  -123, 0.5),    # Table 5-2 (NGSO ผ่อนกว่า)
+    (2483.5,  2500.0, "1MHz", -128, 0.5,  -126, 0.65),   # Table 5-2 (MSS; RDSS มีชุดค่าแยก)
+]
+RE_KM, RGSO_KM = 6371.0, 42164.0
+# กรอบพิกัดไทย: จุดสุดเขตแดน 4 ทิศ (อ้างอิงข้อมูลกรมแผนที่ทหาร)
+TH_LAT = (5.610, 20.468)
+TH_LON = (97.350, 105.617)
+
+def _spread_db(d_km):
+    return 10 * math.log10(4 * math.pi * (d_km * 1000.0) ** 2)
+
+def _slant_km(theta_deg, h_km):
+    t = math.radians(theta_deg); r = (RE_KM + h_km) / RE_KM
+    return RE_KM * (math.sqrt(r * r - math.cos(t) ** 2) - math.sin(t))
+
+def _T(theta, P, r):
+    if r is None: return P
+    if theta <= 5: return P
+    if theta <= 25: return P + r * (theta - 5)
+    return P + 20 * r
+
+_gso_cache = {}
+def _gso_points(slon):
+    """จุด (มุมเงย ε, ระยะ d, lat, lon) ทั่วกรอบพิกัดไทย สำหรับดาวเทียม GSO ที่ลองจิจูด slon"""
+    if slon in _gso_cache: return _gso_cache[slon]
+    pts = []
+    la = TH_LAT[0]
+    while la <= TH_LAT[1] + 1e-9:
+        lo = TH_LON[0]
+        while lo <= TH_LON[1] + 1e-9:
+            cp = math.cos(math.radians(la)) * math.cos(math.radians(lo - slon))
+            psi = math.acos(max(-1.0, min(1.0, cp)))
+            if psi > 1e-6:
+                e = math.degrees(math.atan((cp - RE_KM / RGSO_KM) / math.sin(psi)))
+                if e > 0:
+                    pts.append((e, math.sqrt(RE_KM**2 + RGSO_KM**2 - 2*RE_KM*RGSO_KM*cp), la, lo))
+            lo += 0.25
+        la += 0.25
+    _gso_cache[slon] = pts
+    return pts
+
+def _th_segments(f1, f2, is_gso):
+    """แบ่งย่านที่ตีพิมพ์เป็นส่วนที่มีเกณฑ์ (พร้อมค่า) และส่วนที่ไม่มีเกณฑ์"""
+    segs, cur = [], f1
+    for lo, hi, bw, Pg, rg, Pn, rn in PFD_TH:
+        a, b = max(f1, lo), min(f2, hi)
+        if b > a:
+            segs.append((a, b, bw, (Pg if is_gso else Pn), (rg if is_gso else rn),
+                         "AP5 §1.1" if bw == "4kHz" and hi <= 1000 else "Table 5-2"))
+    segs.sort()
+    un, cur = [], f1
+    for a, b, *_ in segs:
+        if a > cur: un.append((cur, a))
+        cur = max(cur, b)
+    if cur < f2: un.append((cur, f2))
+    return segs, un
+
+def pfd_worst(kind, par, E_bw, P, r):
+    """หา margin แย่สุด: kind='NGSO' (par=perigee km, กวาด θ 0–90°) หรือ 'GSO' (par=ลองจิจูด, กวาดกรอบไทย)
+    คืน (margin, θ*, d, จุด) หรือ None ถ้า GSO มองไม่เห็นจากไทย"""
+    best = None
+    if kind == "NGSO":
+        t = 0.0
+        while t <= 90.0 + 1e-9:
+            d = _slant_km(t, par)
+            m = E_bw - _spread_db(d) - _T(t, P, r)
+            if best is None or m > best[0]: best = (m, t, d, None)
+            t += 0.1
+    else:
+        for e, d, la, lo in _gso_points(par):
+            m = E_bw - _spread_db(d) - _T(e, P, r)
+            if best is None or m > best[0]: best = (m, e, d, (la, lo))
+    return best
+
 def build_crc(mdb_path, ific, thai, allowed_secnums=None, allowed_ids=None):
     """allowed_secnums/ids มาจาก portal CSV (ขอบเขตทางการ) — รายการนอกขอบเขตจะถูกแยกออกมา
     ใน excluded (ไม่ทิ้งเงียบ)"""
@@ -267,9 +351,24 @@ def build_crc(mdb_path, ific, thai, allowed_secnums=None, allowed_ids=None):
     com = mdb_table(mdb_path, "com_el")
     pub = mdb_table(mdb_path, "pub_ssn")
     grp = mdb_table(mdb_path, "grp")
+    em = mdb_table(mdb_path, "emiss")
+    sb = mdb_table(mdb_path, "s_beam")
+    orb = mdb_table(mdb_path, "orbit")
     cinfo = {c["ntc_id"]: c for c in com}
     ssn = ssn_map(pub, "CR/C")
     gmap = {g["grp_id"]: g for g in grp}
+    # ข้อมูลกำลังส่งสำหรับ pfd 9.14 (ฟิลด์พิสูจน์แล้ว: emiss.pwr_ds_max=C8a2/C8b2,
+    # s_beam.gain=B3a1, s_beam.pwr_max_4k/1m=EIRP ต่อ BW อ้างอิง, orbit.perig_km=A4b4e)
+    embyg = defaultdict(list)
+    for e in em:
+        if e.get("pwr_ds_max"):
+            embyg[e["grp_id"]].append(float(e["pwr_ds_max"]))
+    sbk = {(b["ntc_id"], b["beam_name"], b["emi_rcp"]): b for b in sb}
+    perig = {}
+    for o in orb:
+        if o.get("perig_km"):
+            n = o["ntc_id"]
+            perig[n] = min(perig.get(n, 1e9), float(o["perig_km"]))
 
     def in_scope(sec, ids):
         if allowed_secnums is None:
@@ -315,57 +414,183 @@ def build_crc(mdb_path, ific, thai, allowed_secnums=None, allowed_ids=None):
     # ---- Engine A: 9.21/* + 9.14 จาก provn + grp (กรอง wic) ----
     bands = defaultdict(lambda: defaultdict(set))  # (prov, sec) -> (fmin,fmax) -> {emi}
     ids_a = defaultdict(set)
+    # ข้อมูลกำลังส่งแย่สุดต่อย่าน (เฉพาะ emission ขาลง E) สำหรับ pfd 9.14:
+    # (prov,sec) -> (fmin,fmax) -> {"e4":(EIRP,pd,gain,beam,วิธี), "e1":(...)}
+    pinfo = defaultdict(dict)
     for p in pv:
         if p.get("adm") == "THA" and (p["coord_prov"].startswith("9.21") or p["coord_prov"] == "9.14"):
             g = gmap.get(p["grp_id"])
             if g and g.get("wic_no") == ific and g.get("freq_min"):
                 sec = ssn.get(g["ntc_id"], f"(ntc {g['ntc_id']})")
                 key = (p["coord_prov"], sec)
-                bands[key][(float(g["freq_min"]), float(g["freq_max"]))].add(g.get("emi_rcp", ""))
+                bk = (float(g["freq_min"]), float(g["freq_max"]))
+                bands[key][bk].add(g.get("emi_rcp", ""))
                 ids_a[key].add(g["ntc_id"])
+                if p["coord_prov"] == "9.14" and g.get("emi_rcp") == "E":
+                    b = sbk.get((g["ntc_id"], g.get("beam_name", ""), "E"), {})
+                    gain = float(b["gain"]) if b.get("gain") else None
+                    pdm = max(embyg.get(g["grp_id"], [-1e9]))
+                    slot = pinfo[key].setdefault(bk, {"e4": None, "e1": None})
+                    for fld, addb in (("e4", 36.02), ("e1", 60.0)):
+                        mdbf = b.get("pwr_max_4k" if fld == "e4" else "pwr_max_1m")
+                        if mdbf:
+                            cand = (float(mdbf), pdm if pdm > -1e8 else None, gain,
+                                    g.get("beam_name", ""), "ฟิลด์ pwr_max")
+                        elif pdm > -1e8 and gain is not None:
+                            cand = (pdm + addb + gain, pdm, gain, g.get("beam_name", ""), "คำนวณ")
+                        else:
+                            cand = None
+                        if cand and (slot[fld] is None or cand[0] > slot[fld][0]):
+                            slot[fld] = cand
 
     mem_a = {"9.21": [], "9.14": []}
-    det_a = []
+    det_a, pfd_lines = [], []
     for (prov, sec), bset in sorted(bands.items(), key=lambda x: (x[0][0], x[0][1])):
         name, lon, adm = foreign_of(ids_a[(prov, sec)])
         if not in_scope(sec, ids_a[(prov, sec)]):
             excluded.append({"มาตรา": prov, "Special section": sec, "ข่ายงานดาวเทียม": name,
                              "เหตุผล": "ไม่อยู่ในรายการตีพิมพ์ทางการ (portal) ของรอบนี้"})
             continue
-        real, edge = set(), set()
-        if thai is not None:
-            for (a, b) in bset:
-                for t in thai.itertuples(index=False):
-                    lo = max(a, t.freq_start_mhz); hi = min(b, t.freq_end_mhz)
-                    if hi - lo > 0:
-                        real.add(t.network_name)
-                    elif hi - lo == 0:
-                        edge.add(t.network_name)
-            edge -= real
-        band_txt = "\n".join(
-            f"{a:g} – {b:g} MHz [{'/'.join(sorted(e for e in emis if e))}]"
-            for (a, b), emis in sorted(bset.items()))
-        row = {
-            "ข่ายงานดาวเทียม": name, "Nominal Longitude": lon, "BR IFIC": ific,
-            "Special section": sec, "ประเทศ": adm,
-            "ย่านความถี่ (MHz)": band_txt,
-            "ข่ายไทยที่ทับ (ทับจริง)": nl(sorted(real)) if thai is not None else "(ต้องมีฐานไทย)",
-            "แตะขอบ (0 MHz)": nl(sorted(edge)) if thai is not None else "",
-            "มาตรา": prov,
-        }
-        if prov == "9.14":
-            row["หมายเหตุ"] = "ตรวจผลคำนวณ pfd ก่อนแจ้งทักท้วง"
-            mem_a["9.14"].append(row)
-        else:
-            mem_a["9.21"].append(row)
-        for (a, b), emis in sorted(bset.items()):
-            det_a.append({"ข่ายต่างชาติ": name, "มาตรา": prov, "Special section": sec,
-                          "f_min": a, "f_max": b,
-                          "ทิศทาง": "/".join(sorted(e for e in emis if e))})
 
+        # ---------- 9.21: เทียบย่านกับฐานข่ายอวกาศไทย (ตรรกะเดิม) ----------
+        if prov != "9.14":
+            real, edge = set(), set()
+            if thai is not None:
+                for (a, b) in bset:
+                    for t in thai.itertuples(index=False):
+                        lo = max(a, t.freq_start_mhz); hi = min(b, t.freq_end_mhz)
+                        if hi - lo > 0:
+                            real.add(t.network_name)
+                        elif hi - lo == 0:
+                            edge.add(t.network_name)
+                edge -= real
+            band_txt = "\n".join(
+                f"{a:g} – {b:g} MHz [{'/'.join(sorted(e for e in emis if e))}]"
+                for (a, b), emis in sorted(bset.items()))
+            mem_a["9.21"].append({
+                "ข่ายงานดาวเทียม": name, "Nominal Longitude": lon, "BR IFIC": ific,
+                "Special section": sec, "ประเทศ": adm,
+                "ย่านความถี่ (MHz)": band_txt,
+                "ข่ายไทยที่ทับ (ทับจริง)": nl(sorted(real)) if thai is not None else "(ต้องมีฐานไทย)",
+                "แตะขอบ (0 MHz)": nl(sorted(edge)) if thai is not None else "",
+                "มาตรา": prov,
+            })
+            for (a, b), emis in sorted(bset.items()):
+                det_a.append({"ข่ายต่างชาติ": name, "มาตรา": prov, "Special section": sec,
+                              "f_min": a, "f_max": b,
+                              "ทิศทาง": "/".join(sorted(e for e in emis if e))})
+            continue
+
+        # ---------- 9.14: คัดกรอง pfd เทียบเกณฑ์ AP5 (คุ้มครองบริการภาคพื้น) ----------
+        c0 = next((cinfo[i] for i in sorted(ids_a[(prov, sec)]) if i in cinfo), {})
+        lon_raw = (c0.get("long_nom") or "").strip()
+        if lon_raw:
+            kind, par = "GSO", float(lon_raw)
+            orbit_txt = f"GSO {fmt_lon(lon_raw)}"
+        else:
+            pk = min((perig[i] for i in ids_a[(prov, sec)] if i in perig), default=None)
+            kind, par = "NGSO", pk
+            orbit_txt = f"NGSO (perigee {pk:g} km)" if pk else "NGSO (ไม่พบ perigee)"
+        gso = kind == "GSO"
+        vis = _gso_points(par) if gso else None
+        pfd_lines += ["", f"━━━ {name} · {orbit_txt} · {sec} · {adm} ━━━"]
+        if gso:
+            if vis:
+                evals = [p[0] for p in vis]
+                pfd_lines.append(f"หน้าต่างมุมเงยจากอาณาเขตไทย: {min(evals):.1f}° – {max(evals):.1f}° "
+                                 f"(กวาดกรอบพิกัดจุดสุดเขตแดน 4 ทิศ ทีละ 0.25°)")
+            else:
+                pfd_lines.append("ดาวเทียมอยู่ใต้ขอบฟ้าของไทยทั้งประเทศ (ไม่มีจุดใดมองเห็น)")
+
+        for (f1, f2), emis in sorted(bset.items()):
+            dirs = "/".join(sorted(e for e in emis if e))
+            base = {"ข่ายงานดาวเทียม": name, "วงโคจร": orbit_txt, "BR IFIC": ific,
+                    "Special section": sec, "ประเทศ": adm,
+                    "ย่านที่ตีพิมพ์ (MHz)": f"{f1:g} – {f2:g} [{dirs}]"}
+            segs, un = _th_segments(f1, f2, gso)
+            pfd_lines.append(f"ย่านตีพิมพ์ {f1:g} – {f2:g} MHz [{dirs}]")
+
+            if "E" not in emis:
+                mem_a["9.14"].append({**base, "ส่วนที่เทียบ (MHz)": "—", "เกณฑ์ ณ θ* [ที่มา]": "—",
+                                      "pfd คำนวณ": "—", "margin (dB)": "—",
+                                      "ผลการพิจารณา": "มีเฉพาะขาขึ้น (R) — ไม่เข้ากรณี pfd ขาลง",
+                                      "มาตรา": "9.14"})
+                pfd_lines.append("  ▸ มีเฉพาะ emission ขาขึ้น (R) — ไม่เข้ากรณี pfd ขาลง")
+                continue
+
+            info = pinfo.get((prov, sec), {}).get((f1, f2), {"e4": None, "e1": None})
+            for a, b, bw, P, r, srcname in segs:
+                bwtxt = "4 kHz" if bw == "4kHz" else "1 MHz"
+                addb = 36.02 if bw == "4kHz" else 60.0
+                tup = info["e4"] if bw == "4kHz" else info["e1"]
+                seg_lbl = f"{a:g} – {b:g}"
+                if gso and not vis:
+                    mem_a["9.14"].append({**base, "ส่วนที่เทียบ (MHz)": seg_lbl,
+                                          "เกณฑ์ ณ θ* [ที่มา]": f"[{srcname}]",
+                                          "pfd คำนวณ": "—", "margin (dB)": "—",
+                                          "ผลการพิจารณา": "ไม่เกิน — ใต้ขอบฟ้าไทยทั้งประเทศ",
+                                          "มาตรา": "9.14"})
+                    continue
+                if tup is None or (kind == "NGSO" and par is None):
+                    mem_a["9.14"].append({**base, "ส่วนที่เทียบ (MHz)": seg_lbl,
+                                          "เกณฑ์ ณ θ* [ที่มา]": f"P={P}, r={r if r is not None else '—'} [{srcname}]",
+                                          "pfd คำนวณ": "—", "margin (dB)": "—",
+                                          "ผลการพิจารณา": "ข้อมูลใน MDB ไม่ครบ → ตรวจจากเอกสารข่าย",
+                                          "มาตรา": "9.14"})
+                    pfd_lines.append(f"  ▸ ส่วน {seg_lbl} MHz: ข้อมูลกำลังส่ง/วงโคจรไม่ครบใน MDB — ไม่คำนวณ (ห้ามเดา)")
+                    continue
+                E, pwr, gn, beam, how = tup
+                best = pfd_worst(kind, par, E, P, r)
+                m, ts, d, pt = best
+                pfdv = E - _spread_db(d)
+                Tv = _T(ts, P, r)
+                verdict = ("เกิน → เข้าเกณฑ์แจ้งทักท้วง" if m > 0 else "ไม่เกิน → ไม่ต้องแจ้ง")
+                if abs(m) <= 1.0:
+                    verdict += " (ปริ่มเส้น — พิจารณา SSM/Rec. M.1143)"
+                mem_a["9.14"].append({**base, "ส่วนที่เทียบ (MHz)": seg_lbl,
+                                      "เกณฑ์ ณ θ* [ที่มา]": f"{Tv:.1f} /{bwtxt} ที่ θ={ts:.1f}° [{srcname}]",
+                                      "pfd คำนวณ": f"{pfdv:.1f} /{bwtxt} ที่ θ={ts:.1f}°",
+                                      "margin (dB)": f"{m:+.1f}",
+                                      "ผลการพิจารณา": verdict, "มาตรา": "9.14"})
+                dat = (f"pwr_ds_max = {pwr:.1f} dBW/Hz (C8a2/C8b2)" if pwr is not None else "pwr_ds_max: —")
+                gtx = (f"gain = {gn:.1f} dBi (B3a1, บีม {beam})" if gn is not None else f"บีม {beam}")
+                pfd_lines.append(f"  ▸ ส่วน {seg_lbl} MHz — เกณฑ์ {srcname} ({kind}): P = {P}, "
+                                 f"r = {r if r is not None else 'คงที่ทุกมุม'}, อ้างอิงต่อ {bwtxt}")
+                if how == "คำนวณ" and pwr is not None and gn is not None:
+                    pfd_lines.append(f"      {dat} | {gtx} → EIRP = {pwr:.1f} + {addb:.2f} + {gn:.1f} = {E:.1f} dBW/{bwtxt}")
+                else:
+                    pfd_lines.append(f"      EIRP/{bwtxt} = {E:.1f} dBW (ฟิลด์ s_beam.pwr_max | {dat} | {gtx})")
+                loc = f" (จุด {pt[0]:.2f}N, {pt[1]:.2f}E บนกรอบไทย)" if pt else ""
+                pfd_lines.append(f"      จุดแย่สุด θ* = {ts:.1f}°, d = {d:,.0f} km, 10log(4πd²) = {_spread_db(d):.2f} dB{loc}")
+                pfd_lines.append(f"      pfd = {E:.1f} − {_spread_db(d):.2f} = {pfdv:.1f} dBW/m²·{bwtxt} | "
+                                 f"T(θ*) = {Tv:.1f} | margin = {m:+.1f} dB → {verdict}")
+                if kind == "NGSO":
+                    chk = []
+                    for tc in (5.0, 25.0, 90.0):
+                        dc = _slant_km(tc, par)
+                        chk.append(f"θ={tc:g}°: {E - _spread_db(dc) - _T(tc, P, r):+.1f}")
+                    pfd_lines.append(f"      (ตรวจทาน margin รายมุม — {' | '.join(chk)} dB)")
+            for a, b in un:
+                mem_a["9.14"].append({**base, "ส่วนที่เทียบ (MHz)": f"{a:g} – {b:g}",
+                                      "เกณฑ์ ณ θ* [ที่มา]": "ไม่มีใน Table 5-2 / §1.1",
+                                      "pfd คำนวณ": "—", "margin (dB)": "—",
+                                      "ผลการพิจารณา": "ไม่มีเกณฑ์ → ตรวจ footnote ของย่าน",
+                                      "มาตรา": "9.14"})
+                pfd_lines.append(f"  ▸ ส่วน {a:g} – {b:g} MHz: ไม่มีเกณฑ์ใน Table 5-2/§1.1 → ตรวจ footnote (ห้ามยืมย่านข้างเคียง)")
+
+    if pfd_lines:
+        pfd_lines += ["", "─── สมมติฐานการคำนวณ (เหมือนคู่มือฉบับตำรา) ───",
+                      "• worst-case ต่อสถานีอวกาศหนึ่งดวง: กำลังสูงสุด + gain สูงสุด + ระยะใกล้สุด (NGSO ใช้ perigee) + free-space",
+                      "• เกณฑ์: RR Appendix 5 Annex 1 — Table 5-2 (Rev.WRC-19, แถว All other cases; MSS) และ §1.1 (ต่ำกว่า 1 GHz); "
+                      "สูตรมุมตาม NOTE 2: T=P (0–5°), P+r(θ−5) (5–25°), P+20r (25–90°)",
+                      "• GSO: กวาดกรอบพิกัดไทยจากจุดสุดเขตแดน 4 ทิศ (5.610–20.468N, 97.350–105.617E) — เข้มกว่าจริง ~0.2 dB (ทิศปลอดภัย)",
+                      "• NGSO: กวาดมุมตกกระทบ 0–90° ทีละ 0.1°",
+                      "• ผล 'เกิน' = เข้าเกณฑ์ต้องประสานงาน/มีสิทธิ์ทักท้วง มิใช่คำยืนยันว่ารบกวนจริง; ผลปริ่มเส้น (±1 dB) ควรวิเคราะห์ต่อด้วย SSM ตาม Rec. ITU-R M.1143 (AP5 §1.2.3.2)"]
+
+    method_df = pd.DataFrame({"แสดงวิธีทำ 9.14 (ตรวจย้อนได้ทุกค่า)": pfd_lines}) if pfd_lines else pd.DataFrame()
     return (pd.DataFrame(mem_b["9.7"]), pd.DataFrame(mem_b["9.12A"]),
             pd.DataFrame(mem_a["9.21"]), pd.DataFrame(mem_a["9.14"]),
-            pd.DataFrame(flags_rows), pd.DataFrame(det_a), pd.DataFrame(excluded))
+            pd.DataFrame(flags_rows), pd.DataFrame(det_a), pd.DataFrame(excluded), method_df)
 
 # ================= UI =================
 
@@ -478,9 +703,10 @@ if st.button("▶ ประมวลผล", type="primary"):
                     if x:
                         allowed_ids.add(x.strip())
             if thai is None:
-                st.warning("ยังไม่มีฐานความถี่ไทย — 9.21/9.14 จะไม่มีคอลัมน์ข่ายไทยที่ทับ")
+                st.warning("ยังไม่มีฐานความถี่ไทย — 9.21 จะไม่มีคอลัมน์ข่ายไทยที่ทับ "
+                           "(9.14 ไม่ใช้ฐานไทย — คัดกรองด้วย pfd)")
 
-            m97, m912a, m921, m914, flags, det_a, excluded = build_crc(
+            m97, m912a, m921, m914, flags, det_a, excluded, m914_method = build_crc(
                 mdb_path, ific, thai, allowed_secnums, allowed_ids)
             os.unlink(mdb_path)
 
@@ -501,28 +727,40 @@ if st.button("▶ ประมวลผล", type="primary"):
             if no_tha:
                 st.caption("ตีพิมพ์รอบนี้แต่ไม่ระบุ THA (ไม่ต้องดำเนินการ): " + ", ".join(no_tha))
 
+            n914 = m914["ข่ายงานดาวเทียม"].nunique() if len(m914) else 0
             m1, m2, m3, m4, m5 = st.columns(5)
             m1.metric("IFIC", ific)
             m2.metric("9.7", len(m97)); m3.metric("9.12A", len(m912a))
-            m4.metric("9.21/A-C", len(m921)); m5.metric("9.14", len(m914))
+            m4.metric("9.21/A-C", len(m921)); m5.metric("9.14", n914)
 
             for title, df in [("มาตรา 9.7 — BR ระบุชื่อข่ายไทย", m97),
                               ("มาตรา 9.12A — BR ระบุชื่อข่ายไทย", m912a),
-                              ("มาตรา 9.21/A-C — ย่านที่ระบุ THA + เทียบฐานไทย", m921),
-                              ("มาตรา 9.14 — ย่านที่ระบุ THA (สถานีภาคพื้น)", m914)]:
+                              ("มาตรา 9.21/A-C — ย่านที่ระบุ THA + เทียบฐานไทย", m921)]:
                 st.subheader(title)
                 if len(df):
                     st.dataframe(df, width="stretch")
                 else:
                     st.info("ไม่มีในรอบนี้")
 
+            st.subheader("มาตรา 9.14 — คัดกรอง pfd เทียบเกณฑ์ AP5 (คุ้มครองบริการภาคพื้นของไทย)")
+            if len(m914):
+                n_over = int(m914["ผลการพิจารณา"].astype(str).str.startswith("เกิน").sum())
+                n_foot = int(m914["ผลการพิจารณา"].astype(str).str.contains("footnote").sum())
+                st.caption(f"ข่าย {n914} | แถวเทียบ {len(m914)} — เกินเกณฑ์ {n_over} | ต้องตรวจ footnote {n_foot}")
+                st.dataframe(m914, width="stretch")
+                with st.expander("📐 แสดงวิธีทำ 9.14 — หลักฐานการคำนวณทุกค่า (แนบผู้บริหาร/ตรวจย้อนได้)"):
+                    st.text("\n".join(m914_method[m914_method.columns[0]].tolist()) if len(m914_method) else "")
+            else:
+                st.info("ไม่มีในรอบนี้")
+
             wb = [("9.7", m97, [20, 12, 8, 18, 8, 34, 10]),
                   ("9.12A", m912a, [20, 12, 8, 18, 8, 34, 10]),
                   ("9.21", m921, [20, 12, 8, 18, 8, 26, 30, 24, 10]),
-                  ("9.14", m914, [20, 12, 8, 18, 8, 26, 30, 24, 10, 24]),
+                  ("9.14", m914, [20, 16, 7, 14, 7, 18, 13, 22, 20, 9, 30, 7]),
+                  ("9.14 วิธีทำ", m914_method, [120]),
                   ("นอกขอบเขต", excluded, [10, 18, 22, 44]),
                   ("flags 9.7-9.12A", flags, [20, 10, 18, 22, 10, 10]),
-                  ("รายละเอียดย่าน 9.21-9.14", det_a, [20, 10, 18, 12, 12, 10])]
+                  ("รายละเอียดย่าน 9.21", det_a, [20, 10, 18, 12, 12, 10])]
             xls = build_excel([(t, d, w) for t, d, w in wb if len(d)])
             st.download_button("⬇ ดาวน์โหลด Excel", xls,
                                file_name=f"IFIC{ific}_CRC_9.7-9.14.xlsx",
