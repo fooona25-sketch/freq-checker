@@ -21,6 +21,7 @@ st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Sarabun:wght@400;600;700&display=swap');
 html, body, [class*="st-"], button, input, label { font-family:'Sarabun',sans-serif !important; }
+span[data-testid="stIconMaterial"], [class*="material-symbols"] { font-family:'Material Symbols Rounded' !important; }
 header[data-testid="stHeader"] { background:#0E2A52; }
 .nbtc-band { background:#0E2A52; color:#fff; padding:14px 22px;
   border-radius:8px; border-bottom:4px solid #C8102E; margin-bottom:10px; }
