@@ -16,6 +16,26 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
 st.set_page_config(page_title="ThaiSat Freq Checker", layout="wide")
+# ---------------- ธีม กสทช. ----------------
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Sarabun:wght@400;600;700&display=swap');
+html, body, [class*="st-"], button, input, label { font-family:'Sarabun',sans-serif !important; }
+header[data-testid="stHeader"] { background:#0E2A52; }
+.nbtc-band { background:#0E2A52; color:#fff; padding:14px 22px;
+  border-radius:8px; border-bottom:4px solid #C8102E; margin-bottom:10px; }
+.nbtc-band h1 { font-size:1.45rem; margin:0; color:#fff; }
+.nbtc-band p  { margin:3px 0 0; color:#CBD5E1; font-size:.9rem; }
+.stButton>button[kind="primary"], .stDownloadButton>button { background:#0E2A52; border-color:#0E2A52; color:#fff; }
+.stButton>button[kind="primary"]:hover, .stDownloadButton>button:hover { background:#C8102E; border-color:#C8102E; }
+</style>
+""", unsafe_allow_html=True)
+
+if os.path.exists("nbtc_logo.png"):
+    st.logo("nbtc_logo.png")
+st.markdown('<div class="nbtc-band"><h1>ระบบตรวจสอบข่ายงานดาวเทียม BR IFIC</h1>'
+            '<p>ส่วนประสานงานกิจการดาวเทียม · สำนักกิจการดาวเทียมสื่อสาร · สำนักงาน กสทช.</p></div>',
+            unsafe_allow_html=True)
 
 # ---------------- secrets (safe) ----------------
 def get_secret(key, default=None):
@@ -347,7 +367,6 @@ def build_crc(mdb_path, ific, thai, allowed_secnums=None, allowed_ids=None):
             pd.DataFrame(flags_rows), pd.DataFrame(det_a), pd.DataFrame(excluded))
 
 # ================= UI =================
-st.title("🛰️ ตรวจสอบข่ายงานดาวเทียม BR IFIC")
 
 if not check_password():
     st.stop()
