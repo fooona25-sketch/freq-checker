@@ -8,7 +8,7 @@ ThaiSat Freq Checker
 ชื่อข่ายไทยเรียงลงบรรทัดในเซลล์เดียว พร้อมก๊อปลง Word)
 """
 import streamlit as st
-import subprocess, csv, io, tempfile, os, math
+import subprocess, csv, io, tempfile, os, math, re
 import pandas as pd
 from collections import defaultdict, Counter
 from openpyxl import Workbook
@@ -140,6 +140,54 @@ def load_thai(upload, sheet_url):
     if sheet_url:
         return normalise_thai(pd.read_csv(sheet_url)), "Google Sheet"
     return None, None
+
+# ---------------- ตาราง NFAT (บริการภาคพื้นของไทย) ----------------
+_NFAT_UNIT = {"khz": 1e-3, "mhz": 1.0, "ghz": 1e3}
+# ไม่ใช่บริการภาคพื้นตามนิยาม RR (No. 1.6): กิจการดาวเทียมทุกชนิด, space research/operation,
+# radio astronomy — และตัดแถว Not Allocation
+_NFAT_EXCL = re.compile(r"satellite|space research|space operation|radio astronomy|"
+                        r"inter-satellite|not allocation", re.I)
+
+def normalise_nfat(df):
+    df.columns = [str(c).strip() for c in df.columns]
+    need = {"Start_Frequency", "Stop_Frequency", "FrequencyUnit", "EngService", "AllocationType"}
+    if not need.issubset(df.columns):
+        raise ValueError("ตาราง NFAT ต้องมีคอลัมน์: Start_Frequency, Stop_Frequency, "
+                         "FrequencyUnit, EngService, AllocationType")
+    mul = df["FrequencyUnit"].astype(str).str.strip().str.lower().map(_NFAT_UNIT)
+    df = df.assign(
+        f1_mhz=pd.to_numeric(df["Start_Frequency"], errors="coerce") * mul,
+        f2_mhz=pd.to_numeric(df["Stop_Frequency"], errors="coerce") * mul,
+    ).dropna(subset=["f1_mhz", "f2_mhz"])
+    return df
+
+def load_nfat(upload, sheet_url):
+    if upload is not None:
+        df = (pd.read_csv(upload) if upload.name.lower().endswith(".csv")
+              else pd.read_excel(upload))
+        return normalise_nfat(df), "ไฟล์ที่อัปโหลด"
+    if sheet_url:
+        return normalise_nfat(pd.read_csv(sheet_url)), "Google Sheet"
+    return None, None
+
+def nfat_services(nfat, a, b):
+    """บริการภาคพื้นของไทยที่จัดสรรทับช่วง a–b MHz (ตาม NFAT): Primary = ตัวพิมพ์ใหญ่,
+    Secondary = ต่อท้าย (รอง) ตามธรรมเนียม RR"""
+    if nfat is None:
+        return "(ไม่ได้แนบตาราง NFAT)"
+    m = nfat[(nfat["f1_mhz"] < b) & (nfat["f2_mhz"] > a)].sort_values("f1_mhz")
+    out, seen = [], set()
+    for _, r in m.iterrows():
+        e = str(r["EngService"]).strip()
+        if not e or _NFAT_EXCL.search(e):
+            continue
+        pri = str(r["AllocationType"]).strip().lower() == "primary"
+        k = (e.lower(), pri)
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(e.upper() if pri else f"{e} (รอง)")
+    return ", ".join(out) if out else "ไม่มีบริการภาคพื้นจัดสรรในย่านนี้ (ตาม NFAT)"
 
 # ---------------- Excel writer (ทั่วไป) ----------------
 def build_excel(sheets):
@@ -343,9 +391,9 @@ def pfd_worst(kind, par, E_bw, P, r):
             if best is None or m > best[0]: best = (m, e, d, (la, lo))
     return best
 
-def build_crc(mdb_path, ific, thai, allowed_secnums=None, allowed_ids=None):
+def build_crc(mdb_path, ific, thai, allowed_secnums=None, allowed_ids=None, nfat=None):
     """allowed_secnums/ids มาจาก portal CSV (ขอบเขตทางการ) — รายการนอกขอบเขตจะถูกแยกออกมา
-    ใน excluded (ไม่ทิ้งเงียบ)"""
+    ใน excluded (ไม่ทิ้งเงียบ); nfat = ตารางกำหนดคลื่นความถี่แห่งชาติ (บริการภาคพื้นไทย)"""
     tr = mdb_table(mdb_path, "tr_aff_ntw")
     pv = mdb_table(mdb_path, "provn")
     com = mdb_table(mdb_path, "com_el")
@@ -443,8 +491,15 @@ def build_crc(mdb_path, ific, thai, allowed_secnums=None, allowed_ids=None):
                         if cand and (slot[fld] is None or cand[0] > slot[fld][0]):
                             slot[fld] = cand
 
+    # ฐานไทยแยกตามวงโคจร สำหรับ 9.21/A (GSO) และ 9.21/B (NGSO) — อิงชื่อในฐาน:
+    # ลงท้าย "(NGSO)" = NGSO, ลงท้ายตำแหน่ง "(xxE)" = GSO
+    thai_gso = thai_ngso = None
+    if thai is not None:
+        _is_ngso = thai["network_name"].astype(str).str.upper().str.contains(r"\(\s*NGSO\s*\)")
+        thai_gso, thai_ngso = thai[~_is_ngso], thai[_is_ngso]
+
     mem_a = {"9.21": [], "9.14": []}
-    det_a, pfd_lines = [], []
+    det_a, pfd_lines, att6 = [], [], []
     for (prov, sec), bset in sorted(bands.items(), key=lambda x: (x[0][0], x[0][1])):
         name, lon, adm = foreign_of(ids_a[(prov, sec)])
         if not in_scope(sec, ids_a[(prov, sec)]):
@@ -452,29 +507,51 @@ def build_crc(mdb_path, ific, thai, allowed_secnums=None, allowed_ids=None):
                              "เหตุผล": "ไม่อยู่ในรายการตีพิมพ์ทางการ (portal) ของรอบนี้"})
             continue
 
-        # ---------- 9.21: เทียบย่านกับฐานข่ายอวกาศไทย (ตรรกะเดิม) ----------
+        # ---------- 9.21: แยกตามนิยามของ Special Section (เชิงอรรถ CR/C) ----------
+        # 9.21/A = ข่าย GSO ไทย | 9.21/B = ข่าย NGSO ไทย | 9.21/C = สถานีภาคพื้นไทย
         if prov != "9.14":
-            real, edge = set(), set()
-            if thai is not None:
-                for (a, b) in bset:
-                    for t in thai.itertuples(index=False):
-                        lo = max(a, t.freq_start_mhz); hi = min(b, t.freq_end_mhz)
-                        if hi - lo > 0:
-                            real.add(t.network_name)
-                        elif hi - lo == 0:
-                            edge.add(t.network_name)
-                edge -= real
             band_txt = "\n".join(
                 f"{a:g} – {b:g} MHz [{'/'.join(sorted(e for e in emis if e))}]"
                 for (a, b), emis in sorted(bset.items()))
-            mem_a["9.21"].append({
-                "ข่ายงานดาวเทียม": name, "Nominal Longitude": lon, "BR IFIC": ific,
-                "Special section": sec, "ประเทศ": adm,
-                "ย่านความถี่ (MHz)": band_txt,
-                "ข่ายไทยที่ทับ (ทับจริง)": nl(sorted(real)) if thai is not None else "(ต้องมีฐานไทย)",
-                "แตะขอบ (0 MHz)": nl(sorted(edge)) if thai is not None else "",
-                "มาตรา": prov,
-            })
+            if prov == "9.21/C":
+                svc_txt = "\n".join(f"{a:g}–{b:g}: {nfat_services(nfat, a, b)}"
+                                    for (a, b) in sorted(bset)) if nfat is not None \
+                          else "(ไม่ได้แนบตาราง NFAT)"
+                mem_a["9.21"].append({
+                    "ข่ายงานดาวเทียม": name, "Nominal Longitude": lon, "BR IFIC": ific,
+                    "Special section": sec, "ประเทศ": adm,
+                    "ย่านความถี่ (MHz)": band_txt,
+                    "ข่ายไทยที่ทับ (ทับจริง)": "— กรณีสถานีภาคพื้น (ไม่เทียบข่ายดาวเทียม)",
+                    "แตะขอบ (0 MHz)": "—",
+                    "บริการภาคพื้นไทย (NFAT)": svc_txt,
+                    "หมายเหตุ": "เกณฑ์ตาม footnote ของย่าน (AP5 Table 5-1) — ตรวจ footnote ประกอบ",
+                    "มาตรา": prov,
+                })
+            else:
+                tdf = (thai_gso if prov == "9.21/A"
+                       else thai_ngso if prov == "9.21/B" else thai)
+                real, edge = set(), set()
+                if tdf is not None:
+                    for (a, b) in bset:
+                        for t in tdf.itertuples(index=False):
+                            lo = max(a, t.freq_start_mhz); hi = min(b, t.freq_end_mhz)
+                            if hi - lo > 0:
+                                real.add(t.network_name)
+                            elif hi - lo == 0:
+                                edge.add(t.network_name)
+                    edge -= real
+                note = ("เทียบเฉพาะข่าย GSO ไทย (ตามนิยาม 9.21/A)" if prov == "9.21/A"
+                        else "เทียบเฉพาะข่าย NGSO ไทย (ตามนิยาม 9.21/B)" if prov == "9.21/B" else "")
+                mem_a["9.21"].append({
+                    "ข่ายงานดาวเทียม": name, "Nominal Longitude": lon, "BR IFIC": ific,
+                    "Special section": sec, "ประเทศ": adm,
+                    "ย่านความถี่ (MHz)": band_txt,
+                    "ข่ายไทยที่ทับ (ทับจริง)": nl(sorted(real)) if tdf is not None else "(ต้องมีฐานไทย)",
+                    "แตะขอบ (0 MHz)": nl(sorted(edge)) if tdf is not None else "",
+                    "บริการภาคพื้นไทย (NFAT)": "—",
+                    "หมายเหตุ": note,
+                    "มาตรา": prov,
+                })
             for (a, b), emis in sorted(bset.items()):
                 det_a.append({"ข่ายต่างชาติ": name, "มาตรา": prov, "Special section": sec,
                               "f_min": a, "f_max": b,
@@ -514,7 +591,12 @@ def build_crc(mdb_path, ific, thai, allowed_secnums=None, allowed_ids=None):
                 mem_a["9.14"].append({**base, "ส่วนที่เทียบ (MHz)": "—", "เกณฑ์ ณ θ* [ที่มา]": "—",
                                       "pfd คำนวณ": "—", "margin (dB)": "—",
                                       "ผลการพิจารณา": "มีเฉพาะขาขึ้น (R) — ไม่เข้ากรณี pfd ขาลง",
+                                      "บริการภาคพื้นไทย (NFAT)": nfat_services(nfat, f1, f2) if nfat is not None else "—",
                                       "มาตรา": "9.14"})
+                att6.append({"ข่ายงานดาวเทียม": name, "Frequency (MHz)": f"{f1:g} – {f2:g}",
+                             "Power density dB(W/Hz)": "—", "Calculated pfd": "—",
+                             "Max. pfd from Annex 1 of Appendix 5 dB(W/m²)": "—",
+                             "Pass/Fail": "— (ขาขึ้น R)"})
                 pfd_lines.append("  ▸ มีเฉพาะ emission ขาขึ้น (R) — ไม่เข้ากรณี pfd ขาลง")
                 continue
 
@@ -529,14 +611,24 @@ def build_crc(mdb_path, ific, thai, allowed_secnums=None, allowed_ids=None):
                                           "เกณฑ์ ณ θ* [ที่มา]": f"[{srcname}]",
                                           "pfd คำนวณ": "—", "margin (dB)": "—",
                                           "ผลการพิจารณา": "ไม่เกิน — ใต้ขอบฟ้าไทยทั้งประเทศ",
+                                          "บริการภาคพื้นไทย (NFAT)": nfat_services(nfat, a, b) if nfat is not None else "—",
                                           "มาตรา": "9.14"})
+                    att6.append({"ข่ายงานดาวเทียม": name, "Frequency (MHz)": seg_lbl,
+                                 "Power density dB(W/Hz)": "—", "Calculated pfd": "—",
+                                 "Max. pfd from Annex 1 of Appendix 5 dB(W/m²)": f"[{srcname}]",
+                                 "Pass/Fail": "Pass (ใต้ขอบฟ้าไทย)"})
                     continue
                 if tup is None or (kind == "NGSO" and par is None):
                     mem_a["9.14"].append({**base, "ส่วนที่เทียบ (MHz)": seg_lbl,
                                           "เกณฑ์ ณ θ* [ที่มา]": f"P={P}, r={r if r is not None else '—'} [{srcname}]",
                                           "pfd คำนวณ": "—", "margin (dB)": "—",
                                           "ผลการพิจารณา": "ข้อมูลใน MDB ไม่ครบ → ตรวจจากเอกสารข่าย",
+                                          "บริการภาคพื้นไทย (NFAT)": nfat_services(nfat, a, b) if nfat is not None else "—",
                                           "มาตรา": "9.14"})
+                    att6.append({"ข่ายงานดาวเทียม": name, "Frequency (MHz)": seg_lbl,
+                                 "Power density dB(W/Hz)": "—", "Calculated pfd": "ตรวจจากเอกสารข่าย",
+                                 "Max. pfd from Annex 1 of Appendix 5 dB(W/m²)": f"{P} [{srcname}]",
+                                 "Pass/Fail": "—"})
                     pfd_lines.append(f"  ▸ ส่วน {seg_lbl} MHz: ข้อมูลกำลังส่ง/วงโคจรไม่ครบใน MDB — ไม่คำนวณ (ห้ามเดา)")
                     continue
                 E, pwr, gn, beam, how = tup
@@ -551,19 +643,36 @@ def build_crc(mdb_path, ific, thai, allowed_secnums=None, allowed_ids=None):
                                       "เกณฑ์ ณ θ* [ที่มา]": f"{Tv:.1f} /{bwtxt} ที่ θ={ts:.1f}° [{srcname}]",
                                       "pfd คำนวณ": f"{pfdv:.1f} /{bwtxt} ที่ θ={ts:.1f}°",
                                       "margin (dB)": f"{m:+.1f}",
-                                      "ผลการพิจารณา": verdict, "มาตรา": "9.14"})
+                                      "ผลการพิจารณา": verdict,
+                                      "บริการภาคพื้นไทย (NFAT)": nfat_services(nfat, a, b) if nfat is not None else "—",
+                                      "มาตรา": "9.14"})
+                att6.append({"ข่ายงานดาวเทียม": name, "Frequency (MHz)": seg_lbl,
+                             "Power density dB(W/Hz)": (f"{pwr:.1f}" if pwr is not None else "—"),
+                             "Calculated pfd": f"{pfdv:.1f} /{bwtxt}\n(ที่มุม {ts:.1f}°)",
+                             "Max. pfd from Annex 1 of Appendix 5 dB(W/m²)":
+                                 (f"{Tv:.0f} /{bwtxt}\n(ทุกมุม, §1.1)" if r is None
+                                  else f"{Tv:.1f} /{bwtxt}\n(ที่มุม {ts:.1f}°, Table 5-2)"),
+                             "Pass/Fail": ("Fail" if m > 0 else "Pass") + (" *ปริ่มเส้น" if abs(m) <= 1.0 else "")})
                 dat = (f"pwr_ds_max = {pwr:.1f} dBW/Hz (C8a2/C8b2)" if pwr is not None else "pwr_ds_max: —")
                 gtx = (f"gain = {gn:.1f} dBi (B3a1, บีม {beam})" if gn is not None else f"บีม {beam}")
                 pfd_lines.append(f"  ▸ ส่วน {seg_lbl} MHz — เกณฑ์ {srcname} ({kind}): P = {P}, "
                                  f"r = {r if r is not None else 'คงที่ทุกมุม'}, อ้างอิงต่อ {bwtxt}")
                 if how == "คำนวณ" and pwr is not None and gn is not None:
-                    pfd_lines.append(f"      {dat} | {gtx} → EIRP = {pwr:.1f} + {addb:.2f} + {gn:.1f} = {E:.1f} dBW/{bwtxt}")
+                    pfd_lines.append(f"      ขั้น 1  EIRP = pwr_ds_max + 10log₁₀(B_ref) + G = "
+                                     f"{pwr:.1f} + {addb:.2f} + {gn:.1f} = {E:.1f} dBW/{bwtxt}")
                 else:
-                    pfd_lines.append(f"      EIRP/{bwtxt} = {E:.1f} dBW (ฟิลด์ s_beam.pwr_max | {dat} | {gtx})")
+                    pfd_lines.append(f"      ขั้น 1  EIRP/{bwtxt} = {E:.1f} dBW — อ่านตรงจากฟิลด์ s_beam.pwr_max "
+                                     f"(= pwr_ds_max + 10log₁₀(B_ref) + G; {dat} | {gtx})")
                 loc = f" (จุด {pt[0]:.2f}N, {pt[1]:.2f}E บนกรอบไทย)" if pt else ""
-                pfd_lines.append(f"      จุดแย่สุด θ* = {ts:.1f}°, d = {d:,.0f} km, 10log(4πd²) = {_spread_db(d):.2f} dB{loc}")
-                pfd_lines.append(f"      pfd = {E:.1f} − {_spread_db(d):.2f} = {pfdv:.1f} dBW/m²·{bwtxt} | "
-                                 f"T(θ*) = {Tv:.1f} | margin = {m:+.1f} dB → {verdict}")
+                dform = ("d(θ) = Rₑ[√(((Rₑ+h)/Rₑ)² − cos²θ) − sinθ], h = perigee" if kind == "NGSO"
+                         else "d จากกฎโคไซน์: cosψ = cosφ·cosΔλ, d = √(Rₑ²+R²−2RₑR·cosψ)")
+                pfd_lines.append(f"      ขั้น 2  ระยะทาง: {dform} → จุดแย่สุด θ* = {ts:.1f}°, d = {d:,.0f} km{loc}")
+                pfd_lines.append(f"      ขั้น 3  pfd(θ*) = EIRP − 10log₁₀(4πd²) = {E:.1f} − {_spread_db(d):.2f} "
+                                 f"= {pfdv:.1f} dBW/m²·{bwtxt}")
+                pfd_lines.append(f"      ขั้น 4  เกณฑ์ T(θ*) = {('P = ' + format(Tv, '.1f') + ' (คงที่ทุกมุม)') if r is None else ('P + r(θ−5) = ' + str(P) + ' + ' + str(r) + f'×({ts:.1f}−5) = ' + format(Tv, '.1f') if 5 < ts <= 25 else ('P = ' + format(Tv, '.1f') + ' (θ≤5°)' if ts <= 5 else 'P + 20r = ' + str(P) + ' + ' + format(20 * r, 'g') + ' = ' + format(Tv, '.1f')))} dBW/m²·{bwtxt}")
+                pfd_lines.append(f"      ขั้น 5  margin = pfd − T = {pfdv:.1f} − ({Tv:.1f}) = {m:+.1f} dB → {verdict}")
+                if nfat is not None:
+                    pfd_lines.append(f"      บริการภาคพื้นไทยในย่านนี้ (NFAT): {nfat_services(nfat, a, b)}")
                 if kind == "NGSO":
                     chk = []
                     for tc in (5.0, 25.0, 90.0):
@@ -575,8 +684,15 @@ def build_crc(mdb_path, ific, thai, allowed_secnums=None, allowed_ids=None):
                                       "เกณฑ์ ณ θ* [ที่มา]": "ไม่มีใน Table 5-2 / §1.1",
                                       "pfd คำนวณ": "—", "margin (dB)": "—",
                                       "ผลการพิจารณา": "ไม่มีเกณฑ์ → ตรวจ footnote ของย่าน",
+                                      "บริการภาคพื้นไทย (NFAT)": nfat_services(nfat, a, b) if nfat is not None else "—",
                                       "มาตรา": "9.14"})
+                att6.append({"ข่ายงานดาวเทียม": name, "Frequency (MHz)": f"{a:g} – {b:g}",
+                             "Power density dB(W/Hz)": "—", "Calculated pfd": "—",
+                             "Max. pfd from Annex 1 of Appendix 5 dB(W/m²)": "ไม่มีเกณฑ์กำหนด",
+                             "Pass/Fail": "—*ตรวจ footnote"})
                 pfd_lines.append(f"  ▸ ส่วน {a:g} – {b:g} MHz: ไม่มีเกณฑ์ใน Table 5-2/§1.1 → ตรวจ footnote (ห้ามยืมย่านข้างเคียง)")
+                if nfat is not None:
+                    pfd_lines.append(f"      บริการภาคพื้นไทยในย่านนี้ (NFAT): {nfat_services(nfat, a, b)}")
 
     if pfd_lines:
         pfd_lines += ["", "─── สมมติฐานการคำนวณ (เหมือนคู่มือฉบับตำรา) ───",
@@ -587,10 +703,25 @@ def build_crc(mdb_path, ific, thai, allowed_secnums=None, allowed_ids=None):
                       "• NGSO: กวาดมุมตกกระทบ 0–90° ทีละ 0.1°",
                       "• ผล 'เกิน' = เข้าเกณฑ์ต้องประสานงาน/มีสิทธิ์ทักท้วง มิใช่คำยืนยันว่ารบกวนจริง; ผลปริ่มเส้น (±1 dB) ควรวิเคราะห์ต่อด้วย SSM ตาม Rec. ITU-R M.1143 (AP5 §1.2.3.2)"]
 
+    if pfd_lines:
+        pfd_lines = [
+            "สูตรที่ใช้ (ที่มา: คู่มือการคำนวณ pfd ฉบับตำรา — RR Appendix 5 Annex 1)",
+            "  (1) EIRP ต่อแบนด์วิดท์อ้างอิง = pwr_ds_max + 10log₁₀(B_ref) + G      [B_ref: 4 kHz → +36.02 dB, 1 MHz → +60.00 dB]",
+            "  (2) pfd(θ) = EIRP − 10log₁₀(4π·d(θ)²)      [การกระจายบนผิวทรงกลม free-space]",
+            "  (3) เกณฑ์ T(θ) = P (0–5°) | P + r·(θ−5) (5–25°) | P + 20r (25–90°)      [NOTE 2 ของ Table 5-2; §1.1 คงที่ทุกมุม]",
+            "  (4) NGSO: d(θ) = Rₑ·[√(((Rₑ+h)/Rₑ)² − cos²θ) − sinθ]      [h = perigee; Rₑ = 6 371 km]",
+            "  (5) GSO: cosψ = cosφ·cosΔλ, d = √(Rₑ²+R²−2RₑR·cosψ), tanε = (cosψ−Rₑ/R)/sinψ      [R = 42 164 km]",
+            "  (6) margin = pfd(θ*) − T(θ*)  โดย θ* คือมุมที่ margin มากที่สุด → margin > 0 = เกินเกณฑ์",
+        ] + pfd_lines
     method_df = pd.DataFrame({"แสดงวิธีทำ 9.14 (ตรวจย้อนได้ทุกค่า)": pfd_lines}) if pfd_lines else pd.DataFrame()
+    att6_df = pd.DataFrame(att6)
+    if len(att6_df):
+        att6_df["ข่ายงานดาวเทียม"] = att6_df["ข่ายงานดาวเทียม"].mask(
+            att6_df["ข่ายงานดาวเทียม"].eq(att6_df["ข่ายงานดาวเทียม"].shift()), "")
     return (pd.DataFrame(mem_b["9.7"]), pd.DataFrame(mem_b["9.12A"]),
             pd.DataFrame(mem_a["9.21"]), pd.DataFrame(mem_a["9.14"]),
-            pd.DataFrame(flags_rows), pd.DataFrame(det_a), pd.DataFrame(excluded), method_df)
+            pd.DataFrame(flags_rows), pd.DataFrame(det_a), pd.DataFrame(excluded),
+            method_df, att6_df)
 
 # ================= UI =================
 
@@ -614,6 +745,17 @@ else:
             'หรือเพิ่ม  thai_sheet_csv_url = "ลิงก์ CSV"  ใน Secrets')
 thai_file = st.file_uploader("3) ฐานความถี่ไทย (Excel/CSV) — ข้ามได้ถ้าใช้ Google Sheet",
                              type=["xlsx", "csv"])
+
+nfat_url = get_secret("nfat_sheet_csv_url")
+if nfat_url:
+    st.success("ตาราง NFAT (บริการภาคพื้นไทย): ใช้จาก **Google Sheet** ที่ตั้งไว้ใน Secrets "
+               "(อัปโหลดไฟล์ด้านล่างเพื่อใช้แทนเฉพาะครั้งนี้ได้)")
+else:
+    st.info("ตาราง NFAT: ยังไม่ได้ตั้ง Google Sheet — อัปโหลดไฟล์ด้านล่าง "
+            'หรือเพิ่ม  nfat_sheet_csv_url = "ลิงก์ CSV"  ใน Secrets '
+            "(ใช้แสดงบริการภาคพื้นไทยในหน้า 9.14 และ 9.21/C)")
+nfat_file = st.file_uploader("4) ตารางกำหนดคลื่นความถี่แห่งชาติ NFAT (Excel/CSV) — ข้ามได้ถ้าใช้ Google Sheet",
+                             type=["xlsx", "csv"], key="nfat_up")
 with st.expander("ℹ️ วิธีตั้ง Google Sheet เป็นฐานความถี่ไทย"):
     st.markdown(
         "1. ใน Google ชีต: **ไฟล์ → แชร์ → เผยแพร่ไปยังเว็บ**\n"
@@ -641,6 +783,11 @@ if st.button("▶ ประมวลผล", type="primary"):
             thai, thai_src = load_thai(thai_file, sheet_url)
         except Exception as e:
             st.error(f"อ่านฐานความถี่ไทยไม่สำเร็จ: {e}"); st.stop()
+        try:
+            nfat, nfat_src = load_nfat(nfat_file, nfat_url)
+        except Exception as e:
+            nfat, nfat_src = None, None
+            st.warning(f"อ่านตาราง NFAT ไม่สำเร็จ — ดำเนินการต่อโดยไม่มีคอลัมน์บริการภาคพื้น: {e}")
 
         # ---------- โหมด 9.3 ----------
         if is_93:
@@ -706,8 +853,10 @@ if st.button("▶ ประมวลผล", type="primary"):
                 st.warning("ยังไม่มีฐานความถี่ไทย — 9.21 จะไม่มีคอลัมน์ข่ายไทยที่ทับ "
                            "(9.14 ไม่ใช้ฐานไทย — คัดกรองด้วย pfd)")
 
-            m97, m912a, m921, m914, flags, det_a, excluded, m914_method = build_crc(
-                mdb_path, ific, thai, allowed_secnums, allowed_ids)
+            m97, m912a, m921, m914, flags, det_a, excluded, m914_method, m914_att6 = build_crc(
+                mdb_path, ific, thai, allowed_secnums, allowed_ids, nfat)
+            if nfat is not None:
+                st.caption(f"ตาราง NFAT: {nfat_src} ({len(nfat)} แถวจัดสรร)")
             os.unlink(mdb_path)
 
             st.caption(f"ขอบเขต: รายการ CR/C ทางการจาก portal {len(crc_portal)} รายการ")
@@ -735,7 +884,7 @@ if st.button("▶ ประมวลผล", type="primary"):
 
             for title, df in [("มาตรา 9.7 — BR ระบุชื่อข่ายไทย", m97),
                               ("มาตรา 9.12A — BR ระบุชื่อข่ายไทย", m912a),
-                              ("มาตรา 9.21/A-C — ย่านที่ระบุ THA + เทียบฐานไทย", m921)]:
+                              ("มาตรา 9.21 — /A เทียบข่าย GSO ไทย · /B เทียบข่าย NGSO ไทย · /C สถานีภาคพื้น (ดูคอลัมน์ NFAT)", m921)]:
                 st.subheader(title)
                 if len(df):
                     st.dataframe(df, width="stretch")
@@ -748,15 +897,18 @@ if st.button("▶ ประมวลผล", type="primary"):
                 n_foot = int(m914["ผลการพิจารณา"].astype(str).str.contains("footnote").sum())
                 st.caption(f"ข่าย {n914} | แถวเทียบ {len(m914)} — เกินเกณฑ์ {n_over} | ต้องตรวจ footnote {n_foot}")
                 st.dataframe(m914, width="stretch")
-                with st.expander("📐 แสดงวิธีทำ 9.14 — หลักฐานการคำนวณทุกค่า (แนบผู้บริหาร/ตรวจย้อนได้)"):
+                st.markdown("**ตารางสรุปแบบเอกสารแนบ (ต่อข่าย — ก๊อปลง Word ได้)**")
+                st.dataframe(m914_att6, width="stretch")
+                with st.expander("📐 แสดงวิธีทำ 9.14 — สูตร + แทนค่าทุกขั้น (แนบผู้บริหาร/ตรวจย้อนได้)"):
                     st.text("\n".join(m914_method[m914_method.columns[0]].tolist()) if len(m914_method) else "")
             else:
                 st.info("ไม่มีในรอบนี้")
 
             wb = [("9.7", m97, [20, 12, 8, 18, 8, 34, 10]),
                   ("9.12A", m912a, [20, 12, 8, 18, 8, 34, 10]),
-                  ("9.21", m921, [20, 12, 8, 18, 8, 26, 30, 24, 10]),
-                  ("9.14", m914, [20, 16, 7, 14, 7, 18, 13, 22, 20, 9, 30, 7]),
+                  ("9.21", m921, [20, 12, 7, 16, 7, 22, 26, 18, 30, 24, 9]),
+                  ("9.14", m914, [20, 16, 7, 14, 7, 18, 13, 22, 20, 9, 30, 30, 7]),
+                  ("เอกสารแนบ6 9.14", m914_att6, [20, 14, 13, 17, 22, 14]),
                   ("9.14 วิธีทำ", m914_method, [120]),
                   ("นอกขอบเขต", excluded, [10, 18, 22, 44]),
                   ("flags 9.7-9.12A", flags, [20, 10, 18, 22, 10, 10]),
