@@ -219,11 +219,14 @@ def nfat_services(nfat, a, b):
     return ", ".join(out) if out else "ไม่มีบริการภาคพื้นจัดสรรในย่านนี้ (ตาม NFAT)"
 
 # ---------------- Excel writer (ทั่วไป) ----------------
-def build_excel(sheets):
-    """sheets = list ของ (ชื่อชีต, DataFrame, [ความกว้างคอลัมน์])"""
+def build_excel(sheets, green_sheets=()):
+    """sheets = list ของ (ชื่อชีต, DataFrame, [ความกว้างคอลัมน์]);
+    green_sheets = ชีตที่ให้ระบายช่องค่า X (เขียว) / x (เขียวอ่อน) แบบชีตสรุป"""
     F = "Tahoma"
     hf = Font(name=F, bold=True, color="FFFFFF")
     hfill = PatternFill("solid", fgColor="1F3864")
+    gfill = PatternFill("solid", fgColor="92D050")
+    gfill2 = PatternFill("solid", fgColor="E2EFDA")
     bd = Border(*[Side(style="thin", color="D0D0D0")] * 4)
     wb = Workbook(); wb.remove(wb.active)
     for title, df, widths in sheets:
@@ -234,16 +237,28 @@ def build_excel(sheets):
         for c in ws[1]:
             c.font = hf; c.fill = hfill; c.border = bd
             c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        mark_me = title in green_sheets
         for row in ws.iter_rows(min_row=2):
             for c in row:
                 c.font = Font(name=F); c.border = bd
                 c.alignment = Alignment(vertical="top", wrap_text=True)
+                if mark_me and c.value in ("X", "x"):
+                    c.fill = gfill if c.value == "X" else gfill2
+                    c.alignment = Alignment(horizontal="center", vertical="center")
         for i, w in enumerate(widths, 1):
             ws.column_dimensions[get_column_letter(i)].width = w
         ws.freeze_panes = "A2"
         if len(df):
             ws.auto_filter.ref = ws.dimensions
     buf = io.BytesIO(); wb.save(buf); return buf.getvalue()
+
+def thai_sort(names):
+    """ลำดับรายชื่อข่ายไทยตามแบบบันทึก: NGSO ก่อน → GSO (THAICOM ฯลฯ) → THAISAT ปิดท้าย"""
+    def k(n):
+        u = str(n).upper()
+        return (0 if "(NGSO" in u.replace(" ", "") else 1,
+                1 if u.startswith("THAISAT") else 0, u)
+    return sorted(set(names), key=k)
 
 def nl(items):
     return "\n".join(items) if items else "—"
@@ -307,8 +322,8 @@ def memo_93(detail, foreign, nodata):
             .to_dict("index"))
     rows = []
     for sat, g in detail.groupby("ดาวเทียมต่างชาติ"):
-        real = sorted(set(g.loc[g["ประเภท"] == "ทับจริง", "ข่ายไทย"]))
-        edge = sorted(set(g.loc[g["ประเภท"] == "แตะขอบ (0 MHz)", "ข่ายไทย"]) - set(real))
+        real = thai_sort(g.loc[g["ประเภท"] == "ทับจริง", "ข่ายไทย"])
+        edge = thai_sort(set(g.loc[g["ประเภท"] == "แตะขอบ (0 MHz)", "ข่ายไทย"]) - set(real))
         m = meta.get(sat, {})
         rows.append({
             "ข่ายงานดาวเทียม": sat,
@@ -325,10 +340,13 @@ def memo_93(detail, foreign, nodata):
                      "Special section": sec, "ประเทศ": adm,
                      "ข่ายไทยที่กระทบ (S)": "— ไม่มี technical data ในไฟล์รอบนี้ —",
                      "แตะขอบ (0 MHz)": "", "T (มีขาลง)": "", "มาตรา": "9.3"})
+    rows.sort(key=lambda d: int(sec_num(d["Special section"]) or 999999))
     return pd.DataFrame(rows)
 
 # ================= โหมด CR/C =================
 def crc_prov_norm(p):
+    if p.startswith("A30"):          # A30#7.1 / A30A#7.1(-CII) → AP30/30A
+        return "AP30"
     return "9.7" if p.startswith("9.7") else p
 
 def sec_num(sec):
@@ -420,6 +438,72 @@ def pfd_worst(kind, par, E_bw, P, r):
             if best is None or m > best[0]: best = (m, e, d, (la, lo))
     return best
 
+# ================= ชีตสรุปรวมทั้งฉบับ (ฟอร์มตารางทบทวนของ ปบ.) =================
+
+SUM_PROVS = ["9.7", "9.12", "9.12A", "9.21/A", "9.21/B", "9.21/C", "9.14", "9.3", "AP30"]
+
+def build_summary(portal_rows, memo93, R):
+    """1 แถว/ข่ายที่ตีพิมพ์ (ทุกตัวใน portal) × ช่องมาตรา: X = เข้าเกณฑ์/กระทบไทย,
+    x = แตะขอบ/เฉียด — Remark เว้นว่างให้กรอกเอง"""
+    marks = defaultdict(dict)
+
+    def put(sn, prov, val="X"):
+        if not sn:
+            return
+        if marks[sn].get(prov) != "X":
+            marks[sn][prov] = val
+
+    for key, prov in (("m97", "9.7"), ("m912", "9.12"),
+                      ("m912a", "9.12A"), ("ap30", "AP30")):
+        df = R[key]
+        for d in (df.to_dict("records") if len(df) else []):
+            put(sec_num(d["Special section"]), prov)
+    m921 = R["m921"]
+    for d in (m921.to_dict("records") if len(m921) else []):
+        prov, sn = d["มาตรา"], sec_num(d["Special section"])
+        if prov in ("9.21/A", "9.21/B"):
+            real = str(d.get("ข่ายไทยที่ทับ (ทับจริง)", "")).strip()
+            edge = str(d.get("แตะขอบ (0 MHz)", "")).strip()
+            if real not in ("", "—"):
+                put(sn, prov, "X")
+            elif edge not in ("", "—"):
+                put(sn, prov, "x")
+        else:
+            put(sn, prov, "X")
+    m914 = R["m914"]
+    for d in (m914.to_dict("records") if len(m914) else []):
+        put(sec_num(d["Special section"]), "9.14")
+    if memo93 is not None and len(memo93):
+        for d in memo93.to_dict("records"):
+            sn = sec_num(d["Special section"])
+            s = str(d.get("ข่ายไทยที่กระทบ (S)", "")).strip()
+            e = str(d.get("แตะขอบ (0 MHz)", "")).strip()
+            if s and not s.startswith("—"):
+                put(sn, "9.3", "X")
+            elif e and e != "—":
+                put(sn, "9.3", "x")
+
+    rows, seen = [], set()
+    for r in portal_rows:
+        sn = col(r, "Special section number").strip()
+        if not sn or sn in seen:
+            continue
+        seen.add(sn)
+        m = marks.get(sn, {})
+        rows.append({
+            "ADM": col(r, "Notifying administration"),
+            "SATELLITE NETWORK": col(r, "Satellite name"),
+            "SPECIAL SECTION": portal_section_str(r),
+            "Longti": col(r, "Orbital position") or "NGSO",
+            **{p: m.get(p, "") for p in SUM_PROVS},
+            "Remark": "",
+        })
+    cols = ["ADM", "SATELLITE NETWORK", "SPECIAL SECTION", "Longti"] + SUM_PROVS + ["Remark"]
+    df = pd.DataFrame(rows, columns=cols)
+    if len(df):
+        df = df.sort_values(["ADM", "SATELLITE NETWORK"]).reset_index(drop=True)
+    return df
+
 # ================= ผังการชนย่านความถี่รายข่าย =================
 
 def collision_fig(name, meta, thai, ific):
@@ -442,6 +526,14 @@ def collision_fig(name, meta, thai, ific):
     tdf["slot"] = tdf["network_name"].astype(str).str.extract(r"\(([\d.]+E)\)")[0].fillna("")
     tdf["nm"] = tdf["network_name"].astype(str).str.replace(
         r"\s*\((?:NGSO|[\d.]+E)\)\s*$", "", regex=True).str.strip()
+    scope = meta.get("scope", "all")
+    if scope == "gso":
+        tdf = tdf[tdf["kind"] == "GSO"]
+    elif scope == "ngso":
+        tdf = tdf[tdf["kind"] == "NGSO"]
+    scope_txt = {"all": "เทียบฐานข่ายดาวเทียมไทยทั้งหมด",
+                 "gso": "เทียบเฉพาะข่าย GSO ไทย (นิยาม 9.21/A)",
+                 "ngso": "เทียบเฉพาะข่าย NGSO ไทย (นิยาม 9.21/B)"}[scope]
     hits = []
     for a, b, s in F:
         for t in tdf.itertuples(index=False):
@@ -451,7 +543,7 @@ def collision_fig(name, meta, thai, ific):
             elif abs(hi - lo) <= 1e-9 and (abs(a - t.freq_end_mhz) < 1e-6 or abs(b - t.freq_start_mhz) < 1e-6):
                 hits.append((a, b, t.nm, t.kind, t.slot, lo, lo, "แตะขอบ"))
     if not hits:
-        return None, "ข่ายนี้ไม่มีย่านที่ทับหรือแตะขอบกับฐานข่ายไทย"
+        return None, f"รายการนี้ไม่มีย่านที่ทับหรือแตะขอบ ({scope_txt})"
 
     inv = sorted({(h[0], h[1]) for h in hits})
     clus = [[list(inv[0])]]
@@ -483,11 +575,11 @@ def collision_fig(name, meta, thai, ific):
     fig_h = 1.15 + 0.92 * len(panels) + 0.265 * rowcount
     fig = plt.figure(figsize=(9.5, fig_h))
     fig.text(0.5, 1 - 0.28 / fig_h,
-             f"ผังการชนย่านความถี่ — {name} ({meta['adm']}, {meta['orbit']}) เทียบข่ายไทย",
+             f"ผังการชนย่านความถี่ — {name} ({meta['adm']}, {meta['orbit']})",
              ha="center", va="top", fontsize=14, fontweight="bold", color=NAVY)
     fig.text(0.5, 1 - 0.56 / fig_h,
-             f"BR IFIC {ific} · แสดงเฉพาะหน้าต่างย่านที่พบการทับ/แตะขอบ · ↓ ขาลง · ↑ ขาขึ้น · "
-             "แถบแดงโปร่ง = ช่วงที่ทับ · ◆ = แตะขอบ (0 MHz)",
+             f"BR IFIC {ific} · {scope_txt} · ย่านเฉพาะที่ตีพิมพ์ภายใต้มาตรานี้ · "
+             "↓ ขาลง · ↑ ขาขึ้น · แถบแดงโปร่ง = ช่วงที่ทับ · ◆ = แตะขอบ (0 MHz)",
              ha="center", va="top", fontsize=7.8, color="#555")
     y_cursor = 1 - 0.95 / fig_h
     for w0, w1, hi, th, hh in panels:
@@ -569,7 +661,7 @@ _TH_MONTH = ["", "มกราคม", "กุมภาพันธ์", "มี
 def _tn(x):
     return str(x).translate(_TH_DIG)
 
-def build_memo_docx(ific, m97, m912a, m921, m914):
+def build_memo_docx(ific, m97, m912, m912a, m921, m914, memo93=None):
     """ร่างบันทึกข้อความตามฟอร์ม ดบ. (A4, TH SarabunPSK 16, ขอบ 1.5/2/3/2 ซม.,
     เลขหน้าไทย) — ช่องที่แอปไม่มีทางรู้ใส่ (ระบุ) ไว้ให้เติม"""
     import datetime as _dt
@@ -700,23 +792,28 @@ def build_memo_docx(ific, m97, m912a, m921, m914):
         groups.append(("9.7", "ข่ายงานดาวเทียมของประเทศอื่น ที่ต้องประสานงานคลื่นความถี่"
                        "กับข่ายงานดาวเทียมของประเทศไทย ภายใต้ข้อบังคับวิทยุ มาตรา 9.7 มีดังนี้",
                        H7, W7, _rows_std(m97, "ข่ายงานดาวเทียมที่ได้รับผลกระทบ"), None))
-    if len(m912a):
-        groups.append(("9.12A", "ข่ายงานดาวเทียมของประเทศอื่น ที่ต้องประสานงานคลื่นความถี่"
-                       "กับข่ายงานดาวเทียมของประเทศไทย ภายใต้ข้อบังคับวิทยุ มาตรา 9.12A มีดังนี้",
-                       H7, W7, _rows_std(m912a, "ข่ายงานดาวเทียมที่ได้รับผลกระทบ"), None))
-    m921ab = m921[m921["มาตรา"].isin(["9.21/A", "9.21/B"])] if len(m921) else m921
+    r12 = (_rows_std(m912, "ข่ายงานดาวเทียมที่ได้รับผลกระทบ") if len(m912) else []) + \
+          (_rows_std(m912a, "ข่ายงานดาวเทียมที่ได้รับผลกระทบ") if len(m912a) else [])
+    if r12:
+        r12.sort(key=lambda x: int(sec_num(x[3]) or 999999))
+        groups.append(("9.12AB", "ข่ายงานดาวเทียมของประเทศอื่น ที่ต้องประสานงานคลื่นความถี่"
+                       "กับข่ายงานดาวเทียมของประเทศไทย ภายใต้ข้อบังคับวิทยุ มาตรา 9.12 "
+                       "และ 9.12A มีดังนี้", H7, W7, r12, None))
     m921c = m921[m921["มาตรา"] == "9.21/C"] if len(m921) else m921
-    if len(m921ab):
+    for _pv, _scope in (("9.21/A", "GSO"), ("9.21/B", "NGSO")):
+        sub = m921[m921["มาตรา"] == _pv] if len(m921) else m921
+        if not len(sub):
+            continue
         rows = []
-        for d in m921ab.to_dict("records"):
+        for d in sub.to_dict("records"):
             imp = d["ข่ายไทยที่ทับ (ทับจริง)"]
             if str(d.get("แตะขอบ (0 MHz)", "")).strip() not in ("", "—"):
                 imp = f"{imp}\nแตะขอบ: {d['แตะขอบ (0 MHz)']}"
             rows.append([d["ข่ายงานดาวเทียม"], d["Nominal Longitude"], _tn(d["BR IFIC"]),
                          d["Special section"], d["ประเทศ"], imp, d["มาตรา"]])
-        groups.append(("9.21AB", "ข่ายงานดาวเทียมของประเทศอื่น ที่ต้องประสานงานคลื่นความถี่"
-                       "กับข่ายงานดาวเทียมของประเทศไทย ภายใต้ข้อบังคับวิทยุ มาตรา 9.21 "
-                       "(9.21/A ข่าย GSO และ 9.21/B ข่าย NGSO) มีดังนี้", H7, W7, rows, None))
+        groups.append((_pv, "ข่ายงานดาวเทียม GSO และ NGSO ของประเทศอื่น ที่ต้องประสานงาน"
+                       f"คลื่นความถี่กับข่ายงานดาวเทียม {_scope} ของประเทศไทย "
+                       f"ภายใต้ข้อบังคับวิทยุ มาตรา {_pv} มีดังนี้", H7, W7, rows, None))
     if len(m921c):
         H6 = H7[:5] + ["ย่านความถี่\n(MHz)", H7[6]]
         rows = []
@@ -763,6 +860,28 @@ def build_memo_docx(ific, m97, m912a, m921, m914):
                        "จะแจ้งทุกกรณี หากผลการคำนวณ PFD pass จะแจ้งกรณีที่มีผู้ใช้งานจริง "
                        "หากผลการคำนวณ pass และไม่มีผู้ใช้งานจริง จะไม่แจ้งทักท้วงแม้ว่าจะมี"
                        "การใช้งานคลื่นความถี่ตามตารางการกำหนดคลื่นความถี่แห่งชาติก็ตาม"))
+    if memo93 is not None and len(memo93):
+        H93 = ["ข่ายงานดาวเทียม", "Nominal\nLongitude", "Special\nsection", "ประเทศ",
+               "ข่ายงานดาวเทียม\nที่ได้รับผลกระทบ (S)", "T"]
+        W93 = [1900, 1134, 1600, 850, 3816, 476]
+        rows = []
+        for d in memo93.to_dict("records"):
+            s = str(d.get("ข่ายไทยที่กระทบ (S)", "")).strip()
+            e = str(d.get("แตะขอบ (0 MHz)", "")).strip()
+            if e and e != "—":
+                s = (s + "\n" if s and s != "—" else "") + f"แตะขอบ: {e}"
+            rows.append([d["ข่ายงานดาวเทียม"], d["Nominal Longitude"],
+                         d["Special section"], d["ประเทศ"], s,
+                         d.get("T (มีขาลง)", "")])
+        groups.append(("93", "ข่ายงานดาวเทียม GSO และ NGSO ของประเทศอื่น ที่ต้อง"
+                       "ประสานงานคลื่นความถี่กับประเทศไทย ภายใต้ข้อบังคับวิทยุ มาตรา 9.3 "
+                       "(S: Interference to the space services  T: Interference to the "
+                       "terrestrial services และ E: Excluding territory) มีดังนี้",
+                       H93, W93, rows,
+                       "หมายเหตุ คอลัมน์ (S) = ข่ายดาวเทียมไทยที่ย่านความถี่ทับ จากการเทียบ"
+                       "ของ ปบ. · คอลัมน์ T ใส่ X เมื่อข่ายนั้นมี emission ขาลง "
+                       "(มีโอกาสกระทบบริการภาคพื้น) — MDB ไม่ได้ให้ flag S/T ของ BR มา "
+                       "โปรดตรวจทานกับตัว Special Section"))
 
     for key, lead, hd, wd, rows, note in groups:
         k += 1
@@ -781,10 +900,15 @@ def build_memo_docx(ific, m97, m912a, m921, m914):
     prop = {
         "9.7": "เห็นควรแจ้งทักท้วงข่ายงานดาวเทียมของประเทศอื่น ตามข้อ {r}. เนื่องจาก"
                "ข่ายงานดาวเทียมของประเทศไทยอาจได้รับการรบกวน (ตรวจทาน/เพิ่มเหตุผลผู้ร้องขอ)",
-        "9.12A": "เห็นควรแจ้งทักท้วงข่ายงานดาวเทียมของประเทศอื่น ตามข้อ {r}. เนื่องจาก"
-                 "ข่ายงานดาวเทียมของประเทศไทยอาจได้รับการรบกวน",
-        "9.21AB": "เห็นควรแจ้งทักท้วงข่ายงานดาวเทียมของประเทศอื่น ตามข้อ {r}. เนื่องจาก"
+        "9.12AB": "เห็นควรแจ้งทักท้วงข่ายงานดาวเทียมของประเทศอื่น ตามข้อ {r}. เนื่องจาก"
                   "ข่ายงานดาวเทียมของประเทศไทยอาจได้รับการรบกวน",
+        "93": "เห็นควรมีหนังสือแจ้งความคิดเห็นของประเทศไทยไปยัง administration "
+              "ที่เกี่ยวข้อง ตามข้อ {r}. ภายใต้ข้อบังคับวิทยุ มาตรา 9.3 เนื่องจาก"
+              "ข่ายงานดาวเทียมของประเทศไทยอาจได้รับการรบกวน",
+        "9.21/A": "เห็นควรแจ้งทักท้วงข่ายงานดาวเทียมของประเทศอื่น ตามข้อ {r}. เนื่องจาก"
+                  "ข่ายงานดาวเทียม GSO ของประเทศไทยอาจได้รับการรบกวน",
+        "9.21/B": "เห็นควรแจ้งทักท้วงข่ายงานดาวเทียมของประเทศอื่น ตามข้อ {r}. เนื่องจาก"
+                  "ข่ายงานดาวเทียม NGSO ของประเทศไทยอาจได้รับการรบกวน",
         "9.21C": "เห็นควรแจ้งทักท้วงข่ายงานดาวเทียมของประเทศอื่น ตามข้อ {r}. เนื่องจาก"
                  "ข่ายสื่อสารภาคพื้นโลกของประเทศไทยอาจได้รับการรบกวน",
         "9.14": "เห็นควรแจ้งทักท้วงข่ายงานดาวเทียมของประเทศอื่น ตามข้อ {r}. เฉพาะรายการ"
@@ -819,13 +943,6 @@ def build_crc(mdb_path, ific, thai, allowed_secnums=None, allowed_ids=None, nfat
     cinfo = {c["ntc_id"]: c for c in com}
     ssn = ssn_map(pub, "CR/C")
     gmap = {g["grp_id"]: g for g in grp}
-    # ย่านความถี่ทุกกลุ่มต่อ notice (สำหรับผังการชนย่าน)
-    bands_by_ntc = defaultdict(dict)
-    for g in grp:
-        if g.get("wic_no") == ific and g.get("freq_min"):
-            bk_ = (float(g["freq_min"]), float(g["freq_max"]))
-            bands_by_ntc[g["ntc_id"]].setdefault(bk_, set()).add(g.get("emi_rcp", ""))
-    chart_ids = {}
     # ข้อมูลกำลังส่งสำหรับ pfd 9.14 (ฟิลด์พิสูจน์แล้ว: emiss.pwr_ds_max=C8a2/C8b2,
     # s_beam.gain=B3a1, s_beam.pwr_max_4k/1m=EIRP ต่อ BW อ้างอิง, orbit.perig_km=A4b4e)
     embyg = defaultdict(list)
@@ -862,19 +979,18 @@ def build_crc(mdb_path, ific, thai, allowed_secnums=None, allowed_ids=None, nfat
                 return c["sat_name"], fmt_lon(c.get("long_nom", "")), c.get("adm", "")
         return f"ID {sorted(ids)[0]}", "?", "?"
 
-    mem_b, flags_rows, excluded = {"9.7": [], "9.12A": []}, [], []
+    mem_b, flags_rows, excluded = {"9.7": [], "9.12": [], "9.12A": [], "AP30": []}, [], []
     for (prov, sec), a in sorted(agg.items(), key=lambda x: (x[0][0], x[0][1])):
         name, lon, adm = foreign_of(a["ids"])
         if not in_scope(sec, a["ids"]):
             excluded.append({"มาตรา": prov, "Special section": sec, "ข่ายงานดาวเทียม": name,
                              "เหตุผล": "ไม่อยู่ในรายการตีพิมพ์ทางการ (portal) ของรอบนี้"})
             continue
-        chart_ids.setdefault(name, set()).update(a["ids"])
         tgt = mem_b.setdefault(prov, [])
         tgt.append({
             "ข่ายงานดาวเทียม": name, "Nominal Longitude": lon, "BR IFIC": ific,
             "Special section": sec, "ประเทศ": adm,
-            "ข่ายงานดาวเทียมที่ได้รับผลกระทบ": nl(sorted(a["thai"])),
+            "ข่ายงานดาวเทียมที่ได้รับผลกระทบ": nl(thai_sort(a["thai"])),
             "ข้อบังคับวิทยุ": prov,
         })
         for tname, fc, fr in a["flags"]:
@@ -928,7 +1044,6 @@ def build_crc(mdb_path, ific, thai, allowed_secnums=None, allowed_ids=None, nfat
             excluded.append({"มาตรา": prov, "Special section": sec, "ข่ายงานดาวเทียม": name,
                              "เหตุผล": "ไม่อยู่ในรายการตีพิมพ์ทางการ (portal) ของรอบนี้"})
             continue
-        chart_ids.setdefault(name, set()).update(ids_a[(prov, sec)])
 
         # ---------- 9.21: แยกตามนิยามของ Special Section (เชิงอรรถ CR/C) ----------
         # 9.21/A = ข่าย GSO ไทย | 9.21/B = ข่าย NGSO ไทย | 9.21/C = สถานีภาคพื้นไทย
@@ -969,8 +1084,8 @@ def build_crc(mdb_path, ific, thai, allowed_secnums=None, allowed_ids=None, nfat
                     "ข่ายงานดาวเทียม": name, "Nominal Longitude": lon, "BR IFIC": ific,
                     "Special section": sec, "ประเทศ": adm,
                     "ย่านความถี่ (MHz)": band_txt,
-                    "ข่ายไทยที่ทับ (ทับจริง)": nl(sorted(real)) if tdf is not None else "(ต้องมีฐานไทย)",
-                    "แตะขอบ (0 MHz)": nl(sorted(edge)) if tdf is not None else "",
+                    "ข่ายไทยที่ทับ (ทับจริง)": nl(thai_sort(real)) if tdf is not None else "(ต้องมีฐานไทย)",
+                    "แตะขอบ (0 MHz)": nl(thai_sort(edge)) if tdf is not None else "",
                     "บริการภาคพื้นไทย (NFAT)": "—",
                     "หมายเหตุ": note,
                     "มาตรา": prov,
@@ -1141,36 +1256,51 @@ def build_crc(mdb_path, ific, thai, allowed_secnums=None, allowed_ids=None, nfat
     if len(att6_df):
         att6_df["ข่ายงานดาวเทียม"] = att6_df["ข่ายงานดาวเทียม"].mask(
             att6_df["ข่ายงานดาวเทียม"].eq(att6_df["ข่ายงานดาวเทียม"].shift()), "")
-    # ---- ข้อมูลสำหรับผังการชนย่าน: ชื่อข่าย → ย่านทั้งหมด + วงโคจร ----
+    # ---- ผังการชนย่าน: เฉพาะมาตราที่ "เราเทียบเอง" คือ 9.21/A (เทียบ GSO ไทย)
+    #      และ 9.21/B (เทียบ NGSO ไทย) — 9.7/9.12/9.12A เป็นผลคำนวณของ BR ไม่วาดทับ ----
     chart_src = {}
-    for nm_, ids_ in chart_ids.items():
-        ivd = {}
-        for i in ids_:
-            for bk_, e_ in bands_by_ntc.get(i, {}).items():
-                ivd.setdefault(bk_, set()).update(e_)
-        if not ivd:
+    for (prov, sec), bset in bands.items():
+        if prov not in ("9.21/A", "9.21/B"):
             continue
-        c0 = next((cinfo[i] for i in sorted(ids_) if i in cinfo), {})
-        lonr = (c0.get("long_nom") or "").strip()
-        chart_src[nm_] = {
-            "adm": c0.get("adm", "?"),
-            "orbit": f"GSO {fmt_lon(lonr)}" if lonr else "NGSO",
+        if not in_scope(sec, ids_a[(prov, sec)]):
+            continue
+        name, lon, adm = foreign_of(ids_a[(prov, sec)])
+        chart_src[f"{name} — {prov}"] = {
+            "adm": adm,
+            "orbit": f"GSO {lon}" if lon.strip() not in ("", "?", "NGSO") else "NGSO",
             "bands": sorted((a_, b_, "".join(sorted(e_ - {""})))
-                            for (a_, b_), e_ in ivd.items()),
+                            for (a_, b_), e_ in bset.items()),
+            "prov": prov,
+            "scope": "gso" if prov == "9.21/A" else "ngso",
         }
-    return (pd.DataFrame(mem_b["9.7"]), pd.DataFrame(mem_b["9.12A"]),
-            pd.DataFrame(mem_a["9.21"]), pd.DataFrame(mem_a["9.14"]),
-            pd.DataFrame(flags_rows), pd.DataFrame(det_a), pd.DataFrame(excluded),
-            method_df, att6_df, chart_src)
+    def _secsort(df, extra=None):
+        if not len(df):
+            return df
+        k = df["Special section"].map(lambda x: int(sec_num(x) or 999999))
+        d2 = df.assign(_k=k)
+        by = (extra or []) + ["_k"]
+        return d2.sort_values(by, kind="stable").drop(columns="_k").reset_index(drop=True)
+
+    known = {"9.7", "9.12", "9.12A", "AP30"}
+    other = {k: pd.DataFrame(v) for k, v in mem_b.items() if k not in known and v}
+    return {
+        "m97": _secsort(pd.DataFrame(mem_b["9.7"])),
+        "m912": _secsort(pd.DataFrame(mem_b["9.12"])),
+        "m912a": _secsort(pd.DataFrame(mem_b["9.12A"])),
+        "ap30": _secsort(pd.DataFrame(mem_b["AP30"])),
+        "m921": _secsort(pd.DataFrame(mem_a["9.21"]), extra=["มาตรา"]),
+        "m914": _secsort(pd.DataFrame(mem_a["9.14"])),
+        "flags": pd.DataFrame(flags_rows), "det": pd.DataFrame(det_a),
+        "excluded": pd.DataFrame(excluded), "method": method_df, "att6": att6_df,
+        "chart": chart_src, "other": other,
+    }
 
 # ================= UI =================
 
 if not check_password():
     st.stop()
 
-mode = st.radio("เลือกโหมด",
-                ["ทักท้วง 9.3 (API/A)", "ประสานงาน CR/C (9.7 / 9.12A / 9.21 / 9.14)"],
-                horizontal=True)
+st.caption("โหมดเดียวจบ: วิเคราะห์ทั้ง **9.3 (API/A)** และ **CR/C (9.7 / 9.12 / 9.12A / 9.21 / 9.14)** จากไฟล์ชุดเดียว — portal CSV ใบเดียว (กด Reset all filters ก่อน Save list) มีครบทุก section อยู่แล้ว")
 
 c1, c2 = st.columns(2)
 mdb_file = c1.file_uploader("1) ไฟล์ ific.mdb", type=["mdb"])
@@ -1203,17 +1333,15 @@ with st.expander("ℹ️ วิธีตั้ง Google Sheet เป็นฐ�
         "3. ใส่ใน **Settings → Secrets**:  `thai_sheet_csv_url = \"ลิงก์ที่คัดลอก\"`\n"
         "4. ชีตต้องมีคอลัมน์: **network_name, freq_start_mhz, freq_end_mhz**"
     )
-
-is_93 = mode.startswith("ทักท้วง")
-if is_93:
+with st.expander("⚙️ ตัวกรองส่วน 9.3"):
     min_khz = st.number_input("กรองจุดทับซ้อนที่เล็กกว่า (kHz) — 0 = เอาทุกจุด (รวมแตะขอบ)",
                               min_value=0.0, value=0.0, step=1.0)
 
-if st.button("▶ ประมวลผล", type="primary"):
+if st.button("▶ ประมวลผลทั้งฉบับ (9.3 + CR/C)", type="primary"):
     if not mdb_file:
         st.error("ต้องอัปโหลด ific.mdb"); st.stop()
-    if is_93 and not portal_file:
-        st.error("โหมด 9.3 ต้องอัปโหลด portal CSV (ขอบเขตทางการ)"); st.stop()
+    if not portal_file:
+        st.error("ต้องอัปโหลด portal CSV (ขอบเขตทางการ) — กด Reset all filters แล้ว Save list as CSV"); st.stop()
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mdb") as tf:
             tf.write(mdb_file.getvalue()); mdb_path = tf.name
@@ -1229,204 +1357,262 @@ if st.button("▶ ประมวลผล", type="primary"):
             nfat, nfat_src = None, None
             st.warning(f"อ่านตาราง NFAT ไม่สำเร็จ — ดำเนินการต่อโดยไม่มีคอลัมน์บริการภาคพื้น: {e}")
 
-        # ---------- โหมด 9.3 ----------
-        if is_93:
-            if thai is None:
-                st.error("โหมด 9.3 ต้องมีฐานความถี่ไทย"); st.stop()
-            portal_rows = read_portal_csv(portal_file)
-            foreign, apia, nodata = build_foreign_apia(mdb_path, portal_rows, ific)
-            os.unlink(mdb_path)
-            R = {"mode": "93", "ific": ific, "thai_src": thai_src, "thai_len": len(thai),
-                 "apia": len(apia), "nsat": foreign["sat"].nunique() if len(foreign) else 0,
-                 "nodata": nodata, "note": None, "detail": None, "memo": None, "xls": None}
-            if len(foreign) == 0:
-                R["note"] = ("info", "ไม่พบความถี่สำหรับ API/A รอบนี้")
-            else:
-                detail = overlap(foreign, thai, min_khz)
-                if len(detail) == 0:
-                    R["note"] = ("success", "ไม่มีความถี่ใดทับซ้อนกับฐานไทย")
-                else:
-                    R["detail"] = detail
-                    R["memo"] = memo_93(detail, foreign, nodata)
-                    R["xls"] = build_excel([
-                        ("สำหรับบันทึก", R["memo"], [20, 12, 18, 8, 32, 26, 9, 8]),
-                        ("รายละเอียด", detail, [20, 8, 12, 14, 14, 16, 12, 12, 24, 12, 12, 12]),
-                    ])
-            st.session_state["RES"] = R
+        prtl = read_portal_csv(portal_file)
 
-        # ---------- โหมด CR/C ----------
+        # ---------- ส่วน 9.3 (API/A) ----------
+        note93 = None
+        foreign, apia, nodata = build_foreign_apia(mdb_path, prtl, ific)
+        if thai is None:
+            note93 = ("warning", "ไม่มีฐานความถี่ไทย — ข้ามการเทียบ 9.3 รอบนี้")
+            detail = pd.DataFrame()
+            memo93 = pd.DataFrame()
         else:
-            if not portal_file:
-                st.error("โหมด CR/C ต้องอัปโหลด portal CSV (ขอบเขตทางการ) — "
-                         "บนหน้า portal กด Reset all filters แล้ว Save list as CSV จะได้ครบทุก section ในไฟล์เดียว")
-                st.stop()
-            prtl = read_portal_csv(portal_file)
-            crc_portal = [r for r in prtl if col(r, "Special section").startswith("CR")]
-            if not crc_portal:
-                st.error("portal CSV นี้ไม่มีรายการ CR/C — ตอน export อย่ากรองเฉพาะ API/A "
-                         "(กด Reset all filters แล้ว Save list as CSV)")
-                st.stop()
-            allowed_secnums = {col(r, "Special section number").strip() for r in crc_portal}
-            allowed_ids = set()
-            for r in crc_portal:
-                for x in (col(r, "Notice ID"), col(r, "Targeted notice ID")):
-                    if x:
-                        allowed_ids.add(x.strip())
-            if thai is None:
-                st.warning("ยังไม่มีฐานความถี่ไทย — 9.21 จะไม่มีคอลัมน์ข่ายไทยที่ทับ "
-                           "(9.14 ไม่ใช้ฐานไทย — คัดกรองด้วย pfd)")
-
-            (m97, m912a, m921, m914, flags, det_a, excluded,
-             m914_method, m914_att6, chart_src) = build_crc(
-                mdb_path, ific, thai, allowed_secnums, allowed_ids, nfat)
-            os.unlink(mdb_path)
-
-            used_nums = set()
-            for df in (m97, m912a, m921, m914):
-                if len(df):
-                    used_nums |= {sec_num(s) for s in df["Special section"]}
-            no_tha = [f"{r['Special section']}/{r['Special section number']} {r['Satellite name']}"
-                      for r in crc_portal
-                      if col(r, "Special section number").strip() not in used_nums]
-
-            wb = [("9.7", m97, [20, 12, 8, 18, 8, 34, 10]),
-                  ("9.12A", m912a, [20, 12, 8, 18, 8, 34, 10]),
-                  ("9.21", m921, [20, 12, 7, 16, 7, 22, 26, 18, 30, 24, 9]),
-                  ("9.14", m914, [20, 16, 7, 14, 7, 18, 13, 22, 20, 9, 30, 30, 7]),
-                  ("เอกสารแนบ6 9.14", m914_att6, [20, 14, 13, 17, 22, 14]),
-                  ("9.14 วิธีทำ", m914_method, [120]),
-                  ("นอกขอบเขต", excluded, [10, 18, 22, 44]),
-                  ("flags 9.7-9.12A", flags, [20, 10, 18, 22, 10, 10]),
-                  ("รายละเอียดย่าน 9.21", det_a, [20, 10, 18, 12, 12, 10])]
-            xls = build_excel([(t, d, w) for t, d, w in wb if len(d)])
-
-            docx_bytes, docx_err = None, None
-            if _HAS_DOCX:
-                try:
-                    docx_bytes = build_memo_docx(ific, m97, m912a, m921, m914)
-                except Exception as e:
-                    docx_err = f"สร้างร่างบันทึกไม่สำเร็จ: {e}"
+            if len(foreign):
+                detail = overlap(foreign, thai, min_khz)
             else:
-                docx_err = "ยังไม่ได้เพิ่ม python-docx ใน requirements.txt"
+                detail = pd.DataFrame()
+                note93 = ("info", "ไม่พบความถี่สำหรับ API/A รอบนี้")
+            if len(detail):
+                _ord = {r_.sat: int(sec_num(r_.section) or 999999)
+                        for r_ in foreign.itertuples(index=False)}
+                detail = (detail.assign(_k=detail["ดาวเทียมต่างชาติ"].map(_ord))
+                          .sort_values(["_k", "ตปท_f_min", "ข่ายไทย"], kind="stable")
+                          .drop(columns="_k").reset_index(drop=True))
+            if len(detail) == 0:
+                detail = pd.DataFrame(columns=["ดาวเทียมต่างชาติ", "ประเภท", "ข่ายไทย"])
+                if note93 is None:
+                    note93 = ("success", "ไม่มีความถี่ API/A ใดทับซ้อนกับฐานไทย")
+            memo93 = memo_93(detail, foreign, nodata) if (len(detail) or nodata) else pd.DataFrame()
 
-            st.session_state["RES"] = {
-                "mode": "crc", "ific": ific, "thai": thai, "thai_src": thai_src,
-                "nfat_src": nfat_src, "nfat_len": len(nfat) if nfat is not None else 0,
-                "nportal": len(crc_portal), "no_tha": no_tha, "excluded": excluded,
-                "m97": m97, "m912a": m912a, "m921": m921, "m914": m914,
-                "m914_method": m914_method, "m914_att6": m914_att6,
-                "chart_src": chart_src, "xls": xls,
-                "docx": docx_bytes, "docx_err": docx_err,
-            }
+        chart93 = {}
+        if len(detail) and len(foreign):
+            hit_sats = set(detail["ดาวเทียมต่างชาติ"])
+            for sat, g in foreign[foreign["sat"].isin(hit_sats)].groupby("sat"):
+                ivd = {}
+                for r in g.itertuples(index=False):
+                    ivd.setdefault((r.f_min, r.f_max), set()).add(r.emi)
+                m0 = g.iloc[0]
+                chart93[f"{sat} — 9.3"] = {
+                    "adm": m0.adm, "orbit": m0.orbit,
+                    "bands": sorted((a, b, "".join(sorted(e - {""})))
+                                    for (a, b), e in ivd.items()),
+                    "prov": "9.3", "scope": "all",
+                }
 
+        # ---------- ส่วน CR/C ----------
+        crc_portal = [r for r in prtl if col(r, "Special section").startswith("CR")]
+        allowed_secnums = {col(r, "Special section number").strip() for r in crc_portal}
+        allowed_ids = set()
+        for r in crc_portal:
+            for x in (col(r, "Notice ID"), col(r, "Targeted notice ID")):
+                if x:
+                    allowed_ids.add(x.strip())
+        if thai is None:
+            st.warning("ยังไม่มีฐานความถี่ไทย — 9.21 จะไม่มีคอลัมน์ข่ายไทยที่ทับ "
+                       "(9.14 ไม่ใช้ฐานไทย — คัดกรองด้วย pfd)")
+
+        R = build_crc(mdb_path, ific, thai, allowed_secnums, allowed_ids, nfat)
+        os.unlink(mdb_path)
+
+        used_nums = set()
+        for df in (R["m97"], R["m912"], R["m912a"], R["m921"], R["m914"]):
+            if len(df):
+                used_nums |= {sec_num(s) for s in df["Special section"]}
+        no_tha = [f"{r['Special section']}/{r['Special section number']} {r['Satellite name']}"
+                  for r in crc_portal
+                  if col(r, "Special section number").strip() not in used_nums]
+
+        summary = build_summary(prtl, memo93, R)
+        charts = {**chart93, **R["chart"]}
+
+        W7X = [20, 12, 8, 18, 8, 60, 10]
+        wb = [("สรุปรวม", summary, [7, 24, 20, 9] + [7] * len(SUM_PROVS) + [18]),
+              ("9.3 สำหรับบันทึก", memo93, [20, 12, 18, 8, 60, 30, 9, 8]),
+              ("9.3 รายละเอียด", detail, [20, 8, 12, 14, 14, 16, 12, 12, 24, 12, 12, 12]),
+              ("9.7", R["m97"], W7X), ("9.12", R["m912"], W7X), ("9.12A", R["m912a"], W7X),
+              ("AP30-30A", R["ap30"], W7X),
+              ("9.21", R["m921"], [20, 12, 7, 16, 7, 30, 40, 30, 30, 24, 9]),
+              ("9.14", R["m914"], [20, 16, 7, 14, 7, 18, 13, 22, 20, 9, 30, 30, 7]),
+              ("เอกสารแนบ6 9.14", R["att6"], [20, 14, 13, 17, 22, 14]),
+              ("9.14 วิธีทำ", R["method"], [120]),
+              ("นอกขอบเขต", R["excluded"], [10, 18, 22, 44]),
+              ("flags 9.7-9.12A", R["flags"], [20, 10, 18, 22, 10, 10]),
+              ("รายละเอียดย่าน 9.21", R["det"], [20, 10, 18, 12, 12, 10])]
+        for k, dfo in R["other"].items():
+            wb.append((f"มาตรา {k}", dfo, W7X))
+        xls = build_excel([(t, d, w) for t, d, w in wb if d is not None and len(d)],
+                          green_sheets={"สรุปรวม"})
+
+        docx_bytes, docx_err = None, None
+        if _HAS_DOCX:
+            try:
+                docx_bytes = build_memo_docx(ific, R["m97"], R["m912"], R["m912a"],
+                                             R["m921"], R["m914"], memo93)
+            except Exception as e:
+                docx_err = f"สร้างร่างบันทึกไม่สำเร็จ: {e}"
+        else:
+            docx_err = "ยังไม่ได้เพิ่ม python-docx ใน requirements.txt"
+
+        st.session_state["RESA"] = {
+            "ific": ific, "thai": thai, "thai_src": thai_src,
+            "thai_len": len(thai) if thai is not None else 0,
+            "nfat_src": nfat_src, "nfat_len": len(nfat) if nfat is not None else 0,
+            "apia": len(apia), "nodata": nodata, "note93": note93,
+            "nsat": foreign["sat"].nunique() if len(foreign) else 0,
+            "detail": detail, "memo93": memo93,
+            "R": R, "no_tha": no_tha, "ncrc": len(crc_portal),
+            "summary": summary, "charts": charts,
+            "xls": xls, "docx": docx_bytes, "docx_err": docx_err,
+        }
     except Exception as e:
-        st.session_state.pop("RES", None)
+        st.session_state.pop("RESA", None)
         st.error(f"เกิดข้อผิดพลาด: {e}")
 
-# ================= แสดงผลล่าสุด (คงอยู่แม้กดปุ่มดาวน์โหลด/เลือกกราฟ) =================
-RES = st.session_state.get("RES")
+# ================= แสดงผลล่าสุด (คงอยู่แม้กดดาวน์โหลด/สลับแท็บ) =================
+RESA = st.session_state.get("RESA")
+if RESA:
+    ific = RESA["ific"]
+    R = RESA["R"]
+    tb_sum, tb_93, tb_crc, tb_chart = st.tabs(
+        ["📌 สรุปรวม", "9.3 API/A", "CR/C 9.7–9.14", "📊 ผังชนย่าน"])
 
-if RES and RES["mode"] == "93":
-    st.caption(f"ฐานความถี่ไทย: {RES['thai_src']} ({RES['thai_len']} ย่าน)")
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("IFIC", RES["ific"])
-    m2.metric("API/A (ขอบเขต)", RES["apia"])
-    m3.metric("มีความถี่", RES["nsat"])
-    m4.metric("ไม่มี tech data", len(RES["nodata"]))
-    if RES["nodata"]:
-        st.warning("ไม่มี technical data (publication-only): "
-                   + ", ".join(s for s, _, _, _ in RES["nodata"]))
-    if RES["note"]:
-        getattr(st, RES["note"][0])(RES["note"][1])
-    if RES["detail"] is not None:
-        detail, memo = RES["detail"], RES["memo"]
-        n_real = int((detail["ประเภท"] == "ทับจริง").sum())
-        n_edge = int((detail["ประเภท"] == "แตะขอบ (0 MHz)").sum())
-        st.caption(f"จุดทับซ้อนทั้งหมด {len(detail)} — ทับจริง {n_real} | แตะขอบ (0 MHz) {n_edge}")
-        st.subheader("📋 ตารางสำหรับบันทึก (1 แถว/ข่าย — ก๊อปลงบันทึกได้)")
-        st.dataframe(memo, width="stretch")
-        st.subheader("รายละเอียดจุดทับซ้อน")
-        st.dataframe(detail, width="stretch")
-        st.download_button("⬇ ดาวน์โหลด Excel", RES["xls"],
-                           file_name=f"IFIC{RES['ific']}_9.3_ทักท้วง.xlsx",
+    # ---------- แท็บสรุปรวม ----------
+    with tb_sum:
+        s = RESA["summary"]
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("IFIC", ific)
+        m2.metric("ตีพิมพ์ทั้งหมด", len(s))
+        m3.metric("เกี่ยวข้องกับไทย", int((s[SUM_PROVS] != "").any(axis=1).sum()) if len(s) else 0)
+        m4.metric("9.3", int((s["9.3"] != "").sum()) if len(s) else 0)
+        m5.metric("CR/C", int((s[[p for p in SUM_PROVS if p != "9.3"]] != "")
+                              .any(axis=1).sum()) if len(s) else 0)
+        st.caption("X = กระทบ/เข้าเกณฑ์ · x = แตะขอบ (0 MHz) · Remark เว้นว่างให้กรอกเอง "
+                   "(เช่น หนังสือบริษัทที่ร้องขอ)")
+        if len(s):
+            try:
+                sty = s.style.map(
+                    lambda v: ("background-color:#92D050;font-weight:bold;text-align:center"
+                               if v == "X" else
+                               "background-color:#E2EFDA;text-align:center" if v == "x" else ""),
+                    subset=SUM_PROVS)
+                st.dataframe(sty, width="stretch", height=min(38 * len(s) + 40, 700))
+            except Exception:
+                st.dataframe(s, width="stretch")
+        else:
+            st.info("ไม่มีรายการตีพิมพ์ใน portal CSV")
+        st.download_button("⬇ ดาวน์โหลด Excel (ทุกชีต รวม 9.3 + CR/C)", RESA["xls"],
+                           file_name=f"IFIC{ific}_ผลตรวจทั้งฉบับ.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        if RESA.get("docx"):
+            st.download_button("📄 ดาวน์โหลดร่างบันทึกข้อความ (.docx)", RESA["docx"],
+                               file_name=f"ร่างบันทึก_IFIC{ific}.docx",
+                               mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+            st.caption("ร่างตามฟอร์ม ดบ. — รวมทุกมาตรา (9.7 · 9.12+9.12A · 9.21 · 9.14 · 9.3) "
+                       "ช่องที่แอปไม่มีทางรู้ใส่ (ระบุ) ไว้ให้เติม")
+        elif RESA.get("docx_err"):
+            st.info(f"ร่างบันทึก Word: {RESA['docx_err']}")
 
-elif RES and RES["mode"] == "crc":
-    ific = RES["ific"]
-    m97, m912a, m921, m914 = RES["m97"], RES["m912a"], RES["m921"], RES["m914"]
-    if RES["nfat_len"]:
-        st.caption(f"ตาราง NFAT: {RES['nfat_src']} ({RES['nfat_len']} แถวจัดสรร)")
-    st.caption(f"ขอบเขต: รายการ CR/C ทางการจาก portal {RES['nportal']} รายการ")
-    if len(RES["excluded"]):
-        st.warning("ข่ายที่พบใน MDB แต่**ไม่อยู่ในรายการตีพิมพ์รอบนี้** — ตัดออกจากผล "
-                   "(ตรวจสอบได้ในชีต 'นอกขอบเขต'):")
-        st.dataframe(RES["excluded"], width="stretch")
-    if RES["no_tha"]:
-        st.caption("ตีพิมพ์รอบนี้แต่ไม่ระบุ THA (ไม่ต้องดำเนินการ): " + ", ".join(RES["no_tha"]))
+    # ---------- แท็บ 9.3 ----------
+    with tb_93:
+        st.caption(f"ฐานความถี่ไทย: {RESA['thai_src']} ({RESA['thai_len']} ย่าน)")
+        m1, m2, m3 = st.columns(3)
+        m1.metric("API/A (ขอบเขต)", RESA["apia"])
+        m2.metric("มีความถี่", RESA["nsat"])
+        m3.metric("ไม่มี tech data", len(RESA["nodata"]))
+        if RESA["nodata"]:
+            st.warning("ไม่มี technical data (publication-only): "
+                       + ", ".join(x[0] for x in RESA["nodata"]))
+        if RESA["note93"]:
+            getattr(st, RESA["note93"][0])(RESA["note93"][1])
+        detail, memo93 = RESA["detail"], RESA["memo93"]
+        if len(detail):
+            n_real = int((detail["ประเภท"] == "ทับจริง").sum())
+            n_edge = int((detail["ประเภท"] == "แตะขอบ (0 MHz)").sum())
+            st.caption(f"จุดทับซ้อนทั้งหมด {len(detail)} — ทับจริง {n_real} | แตะขอบ (0 MHz) {n_edge}")
+        if memo93 is not None and len(memo93):
+            st.subheader("📋 ตารางสำหรับบันทึก (1 แถว/ข่าย)")
+            st.dataframe(memo93, width="stretch")
+        if len(detail):
+            st.subheader("รายละเอียดจุดทับซ้อน")
+            st.dataframe(detail, width="stretch")
 
-    n914 = m914["ข่ายงานดาวเทียม"].nunique() if len(m914) else 0
-    m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("IFIC", ific)
-    m2.metric("9.7", len(m97)); m3.metric("9.12A", len(m912a))
-    m4.metric("9.21/A-C", len(m921)); m5.metric("9.14", n914)
+    # ---------- แท็บ CR/C ----------
+    with tb_crc:
+        if RESA["nfat_len"]:
+            st.caption(f"ตาราง NFAT: {RESA['nfat_src']} ({RESA['nfat_len']} แถวจัดสรร)")
+        st.caption(f"ขอบเขต: รายการ CR/C ทางการจาก portal {RESA['ncrc']} รายการ")
+        if len(R["excluded"]):
+            st.warning("ข่ายที่พบใน MDB แต่**ไม่อยู่ในรายการตีพิมพ์รอบนี้** — ตัดออกจากผล "
+                       "(ตรวจสอบได้ในชีต 'นอกขอบเขต'):")
+            st.dataframe(R["excluded"], width="stretch")
+        if RESA["no_tha"]:
+            st.caption("ตีพิมพ์รอบนี้แต่ไม่ระบุ THA (ไม่ต้องดำเนินการ): " + ", ".join(RESA["no_tha"]))
 
-    for title, df in [("มาตรา 9.7 — BR ระบุชื่อข่ายไทย", m97),
-                      ("มาตรา 9.12A — BR ระบุชื่อข่ายไทย", m912a),
-                      ("มาตรา 9.21 — /A เทียบข่าย GSO ไทย · /B เทียบข่าย NGSO ไทย · /C สถานีภาคพื้น (ดูคอลัมน์ NFAT)", m921)]:
-        st.subheader(title)
-        if len(df):
-            st.dataframe(df, width="stretch")
+        m914 = R["m914"]
+        n914 = m914["ข่ายงานดาวเทียม"].nunique() if len(m914) else 0
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("9.7", len(R["m97"]))
+        m2.metric("9.12", len(R["m912"]))
+        m3.metric("9.12A", len(R["m912a"]))
+        m4.metric("9.21/A-C", len(R["m921"]))
+        m5.metric("9.14", n914)
+
+        for title, df in [("มาตรา 9.7 — BR ระบุชื่อข่ายไทย (ผลคำนวณของ BR)", R["m97"]),
+                          ("มาตรา 9.12 — BR ระบุชื่อข่ายไทย", R["m912"]),
+                          ("มาตรา 9.12A — BR ระบุชื่อข่ายไทย", R["m912a"]),
+                          ("มาตรา 9.21 — /A เทียบข่าย GSO ไทย · /B เทียบข่าย NGSO ไทย · /C สถานีภาคพื้น (ดูคอลัมน์ NFAT)", R["m921"])]:
+            st.subheader(title)
+            if len(df):
+                st.dataframe(df, width="stretch")
+            else:
+                st.info("ไม่มีในรอบนี้")
+        if len(R["ap30"]):
+            st.subheader("AP30/30A Article 7 — BR ระบุชื่อข่ายไทย")
+            st.dataframe(R["ap30"], width="stretch")
+        for k, dfo in R["other"].items():
+            st.subheader(f"มาตรา {k} — BR ระบุชื่อข่ายไทย")
+            st.dataframe(dfo, width="stretch")
+
+        st.subheader("มาตรา 9.14 — คัดกรอง pfd เทียบเกณฑ์ AP5 (คุ้มครองบริการภาคพื้นของไทย)")
+        if len(m914):
+            n_over = int(m914["ผลการพิจารณา"].astype(str).str.startswith("เกิน").sum())
+            n_foot = int(m914["ผลการพิจารณา"].astype(str).str.contains("footnote").sum())
+            st.caption(f"ข่าย {n914} | แถวเทียบ {len(m914)} — เกินเกณฑ์ {n_over} | ต้องตรวจ footnote {n_foot}")
+            st.dataframe(m914, width="stretch")
+            st.markdown("**ตารางสรุปแบบเอกสารแนบ (ต่อข่าย — ก๊อปลง Word ได้)**")
+            st.dataframe(R["att6"], width="stretch")
+            with st.expander("📐 แสดงวิธีทำ 9.14 — สูตร + แทนค่าทุกขั้น (แนบผู้บริหาร/ตรวจย้อนได้)"):
+                mm = R["method"]
+                st.text("\n".join(mm[mm.columns[0]].tolist()) if len(mm) else "")
         else:
             st.info("ไม่มีในรอบนี้")
 
-    st.subheader("มาตรา 9.14 — คัดกรอง pfd เทียบเกณฑ์ AP5 (คุ้มครองบริการภาคพื้นของไทย)")
-    if len(m914):
-        n_over = int(m914["ผลการพิจารณา"].astype(str).str.startswith("เกิน").sum())
-        n_foot = int(m914["ผลการพิจารณา"].astype(str).str.contains("footnote").sum())
-        st.caption(f"ข่าย {n914} | แถวเทียบ {len(m914)} — เกินเกณฑ์ {n_over} | ต้องตรวจ footnote {n_foot}")
-        st.dataframe(m914, width="stretch")
-        st.markdown("**ตารางสรุปแบบเอกสารแนบ (ต่อข่าย — ก๊อปลง Word ได้)**")
-        st.dataframe(RES["m914_att6"], width="stretch")
-        with st.expander("📐 แสดงวิธีทำ 9.14 — สูตร + แทนค่าทุกขั้น (แนบผู้บริหาร/ตรวจย้อนได้)"):
-            mm = RES["m914_method"]
-            st.text("\n".join(mm[mm.columns[0]].tolist()) if len(mm) else "")
-    else:
-        st.info("ไม่มีในรอบนี้")
-
-    # ---------- ผังการชนย่านความถี่ ----------
-    st.subheader("📊 ผังการชนย่านความถี่รายข่าย (เลือกข่ายเพื่อดูภาพ — แนบบันทึก/สไลด์ได้)")
-    if not _HAS_MPL:
-        st.info("ยังไม่ได้เพิ่ม matplotlib ใน requirements.txt — เพิ่มแล้วแอปจะวาดผังให้อัตโนมัติ")
-    elif RES["thai"] is None:
-        st.info("ต้องมีฐานความถี่ไทยจึงจะวาดผังได้")
-    elif not RES["chart_src"]:
-        st.info("รอบนี้ไม่มีข่ายที่มีข้อมูลย่านความถี่ให้วาด")
-    else:
-        if not _THAI_FONT_OK:
-            st.warning("ไม่พบไฟล์ Sarabun-Regular.ttf / Sarabun-Bold.ttf ใน repo — "
-                       "ตัวหนังสือไทยในผังจะแสดงไม่ได้จนกว่าจะอัปโหลดฟอนต์ (วางที่ root ของ repo ได้เลย)")
-        sel = st.selectbox("ข่ายต่างชาติ", sorted(RES["chart_src"]), key="cc_sel")
-        fig, why = collision_fig(sel, RES["chart_src"][sel], RES["thai"], ific)
-        if fig is None:
-            st.info(why)
+    # ---------- แท็บผังชนย่าน ----------
+    with tb_chart:
+        st.caption("วาดเฉพาะมาตราที่ **ปบ. เทียบเอง**: 9.3 (เทียบฐานข่ายไทยทั้งหมด), "
+                   "9.21/A (เทียบ GSO ไทย), 9.21/B (เทียบ NGSO ไทย) — "
+                   "ส่วน 9.7/9.12/9.12A เป็นผลคำนวณของ BR จึงไม่วาดทับ")
+        charts = RESA["charts"]
+        if not _HAS_MPL:
+            st.info("ยังไม่ได้เพิ่ม matplotlib ใน requirements.txt — เพิ่มแล้วแอปจะวาดผังให้อัตโนมัติ")
+        elif RESA["thai"] is None:
+            st.info("ต้องมีฐานความถี่ไทยจึงจะวาดผังได้")
+        elif not charts:
+            st.info("รอบนี้ไม่มีรายการ 9.3 / 9.21A / 9.21B ที่ทับกับฐานไทยให้วาด")
         else:
-            st.pyplot(fig)
-            _buf = io.BytesIO()
-            fig.savefig(_buf, format="png", dpi=150, bbox_inches="tight", facecolor="white")
-            plt.close(fig)
-            st.download_button("⬇ ดาวน์โหลดผังเป็น PNG", _buf.getvalue(),
-                               file_name=f"ผังชนย่าน_{sel}_IFIC{ific}.png",
-                               mime="image/png", key="cc_png")
-
-    # ---------- ดาวน์โหลด ----------
-    st.download_button("⬇ ดาวน์โหลด Excel", RES["xls"],
-                       file_name=f"IFIC{ific}_CRC_9.7-9.14.xlsx",
-                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    if RES.get("docx"):
-        st.download_button("📄 ดาวน์โหลดร่างบันทึกข้อความ (.docx)", RES["docx"],
-                           file_name=f"ร่างบันทึก_IFIC{ific}.docx",
-                           mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
-        st.caption("ร่างตามฟอร์ม ดบ. — ช่องที่แอปไม่มีทางรู้ใส่ (ระบุ) ไว้ให้เติม "
-                   "ก๊อปเนื้อหาไปจัดเรียงในไฟล์จริงได้เลย")
-    elif RES.get("docx_err"):
-        st.info(f"ร่างบันทึก Word: {RES['docx_err']}")
+            if not _THAI_FONT_OK:
+                st.warning("ไม่พบไฟล์ Sarabun-Regular.ttf / Sarabun-Bold.ttf ใน repo — "
+                           "ตัวหนังสือไทยในผังจะแสดงไม่ได้จนกว่าจะอัปโหลดฟอนต์ (วางที่ root ของ repo ได้เลย)")
+            opts = sorted(charts, key=lambda k: (charts[k]["prov"] != "9.3", k))
+            sel = st.selectbox("เลือกรายการ (ข่าย — มาตรา)", opts, key="cc_sel")
+            fig, why = collision_fig(sel, charts[sel], RESA["thai"], ific)
+            if fig is None:
+                st.info(why)
+            else:
+                st.pyplot(fig)
+                _buf = io.BytesIO()
+                fig.savefig(_buf, format="png", dpi=150, bbox_inches="tight", facecolor="white")
+                plt.close(fig)
+                st.download_button("⬇ ดาวน์โหลดผังเป็น PNG", _buf.getvalue(),
+                                   file_name=f"ผังชนย่าน_{sel.replace(' — ', '_').replace('/', '-')}_IFIC{ific}.png",
+                                   mime="image/png", key="cc_png")
