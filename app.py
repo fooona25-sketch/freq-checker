@@ -652,6 +652,125 @@ def collision_fig(name, meta, thai, ific):
         ax.spines["bottom"].set_color("#999")
     return fig, None
 
+def charts_pdf(charts, thai, ific, progress=None):
+    """PDF รวมเล่ม: หน้าแรกเป็นสารบัญครบทุกรายการที่ตรวจ (ไม่พบการทับ = ระบุชัด)
+    ตามด้วยผังหน้าละรายการ เรียง 9.3 → 9.21/A → 9.21/B ตามเลข section"""
+    from matplotlib.backends.backend_pdf import PdfPages
+    import math as _m
+    order = sorted(charts, key=lambda k: (charts[k].get("prov") != "9.3",
+                                          charts[k].get("secn", 999999), k))
+    t0 = thai.copy()
+    t0["kind"] = t0["network_name"].astype(str).str.upper().str.contains(
+        r"\(\s*NGSO\s*\)").map({True: "NGSO", False: "GSO"})
+    res = []
+    for k in order:
+        m = charts[k]
+        sc = m.get("scope", "all")
+        td = t0 if sc == "all" else t0[t0["kind"] == ("GSO" if sc == "gso" else "NGSO")]
+        nh = ne = 0
+        for a, b, _d in m["bands"]:
+            for t in td.itertuples(index=False):
+                lo, hi = max(a, t.freq_start_mhz), min(b, t.freq_end_mhz)
+                if hi > lo + 1e-9:
+                    nh += 1
+                elif abs(hi - lo) <= 1e-9 and (abs(a - t.freq_end_mhz) < 1e-6
+                                               or abs(b - t.freq_start_mhz) < 1e-6):
+                    ne += 1
+        res.append((k, nh, ne))
+    NAVY2, RED2, GRN2 = "#0E2A52", "#B3261E", "#2E7D32"
+    GROUPS = [("9.3", "มาตรา 9.3 — API/A  (เทียบฐานข่ายดาวเทียมไทยทั้งหมด)"),
+              ("9.21/A", "มาตรา 9.21/A  (เทียบเฉพาะข่าย GSO ไทย)"),
+              ("9.21/B", "มาตรา 9.21/B  (เทียบเฉพาะข่าย NGSO ไทย)")]
+    # จัดบรรทัด: หัวกลุ่ม + รายการ แล้วแบ่งหน้า
+    lines = []
+    for pv, gt in GROUPS:
+        ent = [(k, h, e) for k, h, e in res if charts[k].get("prov") == pv]
+        if not ent:
+            continue
+        lines.append(("g", f"{gt} — {len(ent)} รายการ"))
+        lines.extend(("r", k, h, e) for k, h, e in ent)
+    CAP = 30.0
+    pages, cur, used = [], [], 0.0
+    for ln in lines:
+        w = 1.6 if ln[0] == "g" else 1.0
+        if used + w > CAP and cur:
+            pages.append(cur); cur, used = [], 0.0
+        cur.append(ln); used += w
+    if cur:
+        pages.append(cur)
+    n_idx = max(1, len(pages))
+    ordered_rows = [ln[1:] for ln in lines if ln[0] == "r"]
+    page_no, p = {}, n_idx + 1
+    for k, h, e in ordered_rows:
+        if h + e:
+            page_no[k] = p; p += 1
+
+    import datetime as _dt
+    buf = io.BytesIO()
+    pdf = PdfPages(buf)
+    for ip, pls in enumerate(pages):
+        fig = plt.figure(figsize=(9.5, 12.2))
+        fig.patches.append(_Rect((0, 0.945), 1, 0.055, color=NAVY2,
+                                 transform=fig.transFigure, zorder=1))
+        fig.text(0.055, 0.9725, "สารบัญผังการชนย่านความถี่" + ("  (ต่อ)" if ip else ""),
+                 fontsize=14, fontweight="bold", color="white", va="center", zorder=2)
+        fig.text(0.945, 0.9725, f"BR IFIC {ific}  ·  จัดทำ {_dt.date.today():%d/%m/%Y}",
+                 fontsize=8.5, color="#C9D4E6", ha="right", va="center", zorder=2)
+        fig.text(0.055, 0.932, "ครอบคลุมทุกรายการที่ ปบ. เทียบความถี่เอง — รายการที่ไม่พบการทับ/แตะขอบ "
+                 "แสดงผลการตรวจไว้โดยไม่มีหน้าแผนภาพ", fontsize=7.3, color="#777")
+        XN, XA, XO, XR, XP = 0.055, 0.50, 0.575, 0.905, 0.945
+        y = 0.905
+        def colhead(yy):
+            for x_, t_, ha_ in ((XN, "ข่ายงานดาวเทียม", "left"), (XA, "ADM", "left"),
+                                (XO, "วงโคจร", "left"), (XR, "ผลการตรวจ", "right"),
+                                (XP, "หน้า", "right")):
+                fig.text(x_, yy, t_, fontsize=7.6, fontweight="bold", color="#6B6355", ha=ha_)
+            fig.lines.append(plt.Line2D([0.045, 0.955], [yy - 0.008] * 2,
+                                        transform=fig.transFigure, color="#B9B4A8", lw=0.8))
+        zebra = 0
+        for ln in pls:
+            if ln[0] == "g":
+                y -= 0.010
+                fig.text(XN, y, ln[1], fontsize=9.8, fontweight="bold", color=NAVY2)
+                y -= 0.022
+                colhead(y); y -= 0.024
+                zebra = 0
+            else:
+                _, k, h, e = ln
+                m = charts[k]
+                if zebra % 2 == 0:
+                    fig.patches.append(_Rect((0.045, y - 0.0068), 0.91, 0.0222,
+                                             color="#F4F1EA", transform=fig.transFigure, zorder=0))
+                zebra += 1
+                fig.text(XN, y, k.split(" — ")[0], fontsize=8.6, zorder=2)
+                fig.text(XA, y, m.get("adm", ""), fontsize=8.2, color="#444", zorder=2)
+                fig.text(XO, y, m.get("orbit", ""), fontsize=8.2, color="#444", zorder=2)
+                if h + e:
+                    r_ = f"ทับ {h} จุด" + (f"  ·  แตะขอบ {e}" if e else "")
+                    fig.text(XR, y, r_, fontsize=8.4, ha="right", color=RED2,
+                             fontweight="bold", zorder=2)
+                    fig.text(XP, y, str(page_no[k]), fontsize=8.6, ha="right",
+                             color=NAVY2, fontweight="bold", zorder=2)
+                else:
+                    fig.text(XR, y, "ไม่พบการทับ/แตะขอบ", fontsize=8.4, ha="right",
+                             color=GRN2, zorder=2)
+                    fig.text(XP, y, "—", fontsize=8.6, ha="right", color="#999", zorder=2)
+                y -= 0.0222
+        fig.text(0.5, 0.018, f"— {ip + 1} —", ha="center", fontsize=7, color="#888")
+        pdf.savefig(fig); plt.close(fig)
+    for i, (k, h, e) in enumerate(ordered_rows, start=1):
+        if progress:
+            progress(i / len(ordered_rows))
+        if not (h + e):
+            continue
+        fig, _why = collision_fig(k, charts[k], thai, ific)
+        if fig is None:
+            continue
+        fig.text(0.985, 0.006, f"หน้า {page_no[k]}", ha="right", fontsize=6.5, color="#888")
+        pdf.savefig(fig); plt.close(fig)
+    pdf.close()
+    return buf.getvalue()
+
 # ================= ร่างบันทึกข้อความ (.docx) =================
 
 _TH_DIG = str.maketrans("0123456789", "๐๑๒๓๔๕๖๗๘๙")
@@ -1270,7 +1389,8 @@ def build_crc(mdb_path, ific, thai, allowed_secnums=None, allowed_ids=None, nfat
             "orbit": f"GSO {lon}" if lon.strip() not in ("", "?", "NGSO") else "NGSO",
             "bands": sorted((a_, b_, "".join(sorted(e_ - {""})))
                             for (a_, b_), e_ in bset.items()),
-            "prov": prov,
+            "prov": prov, "sec": sec,
+            "secn": int(sec_num(sec) or 999999),
             "scope": "gso" if prov == "9.21/A" else "ngso",
         }
     def _secsort(df, extra=None):
@@ -1342,10 +1462,24 @@ if st.button("▶ ประมวลผลทั้งฉบับ (9.3 + CR/C)"
         st.error("ต้องอัปโหลด ific.mdb"); st.stop()
     if not portal_file:
         st.error("ต้องอัปโหลด portal CSV (ขอบเขตทางการ) — กด Reset all filters แล้ว Save list as CSV"); st.stop()
+    _orbit = st.empty()
+    _orbit.markdown(
+        """<div style="display:flex;align-items:center;gap:16px;padding:6px 2px">
+<div style="position:relative;width:58px;height:58px;flex:none">
+  <div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:26px">🌏</div>
+  <div style="position:absolute;inset:0;animation:ccorbit 2s linear infinite">
+    <span style="position:absolute;top:-7px;left:50%;transform:translateX(-50%);font-size:17px">🛰️</span>
+  </div>
+</div>
+<b style="color:#0E2A52">กำลังประมวลผล BR IFIC ทั้งฉบับ — อย่าเพิ่งปิดหน้า</b></div>
+<style>@keyframes ccorbit{to{transform:rotate(360deg)}}</style>""",
+        unsafe_allow_html=True)
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mdb") as tf:
             tf.write(mdb_file.getvalue()); mdb_path = tf.name
 
+        _stat = st.status("🛰️ กำลังประมวลผลทั้งฉบับ...", expanded=True)
+        _stat.write("📂 อ่านไฟล์ MDB / ฐานความถี่ไทย / NFAT / portal CSV")
         ific = detect_ific(mdb_table(mdb_path, "notice"))
         try:
             thai, thai_src = load_thai(thai_file, sheet_url)
@@ -1360,6 +1494,7 @@ if st.button("▶ ประมวลผลทั้งฉบับ (9.3 + CR/C)"
         prtl = read_portal_csv(portal_file)
 
         # ---------- ส่วน 9.3 (API/A) ----------
+        _stat.write("📡 ส่วน 9.3 (API/A): เทียบความถี่กับฐานข่ายไทย")
         note93 = None
         foreign, apia, nodata = build_foreign_apia(mdb_path, prtl, ific)
         if thai is None:
@@ -1385,9 +1520,8 @@ if st.button("▶ ประมวลผลทั้งฉบับ (9.3 + CR/C)"
             memo93 = memo_93(detail, foreign, nodata) if (len(detail) or nodata) else pd.DataFrame()
 
         chart93 = {}
-        if len(detail) and len(foreign):
-            hit_sats = set(detail["ดาวเทียมต่างชาติ"])
-            for sat, g in foreign[foreign["sat"].isin(hit_sats)].groupby("sat"):
+        if len(foreign) and thai is not None:
+            for sat, g in foreign.groupby("sat"):
                 ivd = {}
                 for r in g.itertuples(index=False):
                     ivd.setdefault((r.f_min, r.f_max), set()).add(r.emi)
@@ -1396,10 +1530,13 @@ if st.button("▶ ประมวลผลทั้งฉบับ (9.3 + CR/C)"
                     "adm": m0.adm, "orbit": m0.orbit,
                     "bands": sorted((a, b, "".join(sorted(e - {""})))
                                     for (a, b), e in ivd.items()),
-                    "prov": "9.3", "scope": "all",
+                    "prov": "9.3", "sec": m0.section,
+                    "secn": int(sec_num(m0.section) or 999999),
+                    "scope": "all",
                 }
 
         # ---------- ส่วน CR/C ----------
+        _stat.write("🛰️ ส่วน CR/C: 9.7 / 9.12 / 9.12A / 9.21 / 9.14 (คำนวณ pfd)")
         crc_portal = [r for r in prtl if col(r, "Special section").startswith("CR")]
         allowed_secnums = {col(r, "Special section number").strip() for r in crc_portal}
         allowed_ids = set()
@@ -1422,6 +1559,7 @@ if st.button("▶ ประมวลผลทั้งฉบับ (9.3 + CR/C)"
                   for r in crc_portal
                   if col(r, "Special section number").strip() not in used_nums]
 
+        _stat.write("📦 สรุปรวม + สร้าง Excel + ร่างบันทึก Word")
         summary = build_summary(prtl, memo93, R)
         charts = {**chart93, **R["chart"]}
 
@@ -1464,7 +1602,12 @@ if st.button("▶ ประมวลผลทั้งฉบับ (9.3 + CR/C)"
             "summary": summary, "charts": charts,
             "xls": xls, "docx": docx_bytes, "docx_err": docx_err,
         }
+        st.session_state.pop("charts_pdf", None)
+        _stat.update(label="✅ ประมวลผลเสร็จ — เลื่อนลงดูผล 4 แท็บด้านล่าง",
+                     state="complete", expanded=False)
+        _orbit.empty()
     except Exception as e:
+        _orbit.empty()
         st.session_state.pop("RESA", None)
         st.error(f"เกิดข้อผิดพลาด: {e}")
 
@@ -1603,7 +1746,8 @@ if RESA:
             if not _THAI_FONT_OK:
                 st.warning("ไม่พบไฟล์ Sarabun-Regular.ttf / Sarabun-Bold.ttf ใน repo — "
                            "ตัวหนังสือไทยในผังจะแสดงไม่ได้จนกว่าจะอัปโหลดฟอนต์ (วางที่ root ของ repo ได้เลย)")
-            opts = sorted(charts, key=lambda k: (charts[k]["prov"] != "9.3", k))
+            opts = sorted(charts, key=lambda k: (charts[k]["prov"] != "9.3",
+                                                 charts[k].get("secn", 999999), k))
             sel = st.selectbox("เลือกรายการ (ข่าย — มาตรา)", opts, key="cc_sel")
             fig, why = collision_fig(sel, charts[sel], RESA["thai"], ific)
             if fig is None:
@@ -1616,3 +1760,20 @@ if RESA:
                 st.download_button("⬇ ดาวน์โหลดผังเป็น PNG", _buf.getvalue(),
                                    file_name=f"ผังชนย่าน_{sel.replace(' — ', '_').replace('/', '-')}_IFIC{ific}.png",
                                    mime="image/png", key="cc_png")
+            st.divider()
+            st.markdown("**📚 PDF รวมเล่มทุกรายการ** — หน้าแรกเป็นสารบัญครบทุกรายการที่ตรวจ "
+                        "(รายการที่ไม่พบการทับระบุผลไว้ชัด) ตามด้วยผังหน้าละรายการ")
+            if st.button(f"🗜 สร้าง PDF รวมเล่ม ({len(charts)} รายการ)", key="pdf_all_btn"):
+                _pg = st.progress(0.0, text="🛰️ กำลังวาดผังทีละรายการ...")
+                try:
+                    st.session_state["charts_pdf"] = charts_pdf(
+                        charts, RESA["thai"], ific,
+                        progress=lambda f: _pg.progress(f, text=f"🛰️ กำลังวาดผัง... {int(f*100)}%"))
+                    _pg.progress(1.0, text="เสร็จแล้ว")
+                except Exception as e:
+                    st.error(f"สร้าง PDF ไม่สำเร็จ: {e}")
+            if st.session_state.get("charts_pdf"):
+                st.download_button("⬇ ดาวน์โหลด PDF รวมเล่ม",
+                                   st.session_state["charts_pdf"],
+                                   file_name=f"ผังชนย่านทั้งหมด_IFIC{ific}.pdf",
+                                   mime="application/pdf", key="pdf_all_dl")
